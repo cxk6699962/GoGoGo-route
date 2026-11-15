@@ -6,6 +6,7 @@
 > 使用前请阅读 [SAFE_USE.md](SAFE_USE.md)：仅限自有设备上的学习、开发与测试，
 > 严禁用于考勤代打卡、伪造行程、跟踪他人、诈骗或规避监管。
 > 修改点见 [route-loop.patch](route-loop.patch)，完整源码随 Release 提供。
+> 免责声明见 [DISCLAIMER.md](DISCLAIMER.md)。
 
 # 影梭
 
