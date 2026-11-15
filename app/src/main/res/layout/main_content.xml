@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.coordinatorlayout.widget.CoordinatorLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    tools:context=".MainActivity">
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+        <com.google.android.material.appbar.AppBarLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:theme="@style/AppTheme.AppBarOverlay">
+
+            <androidx.appcompat.widget.Toolbar
+                android:id="@+id/toolbar"
+                android:layout_width="match_parent"
+                android:layout_height="?attr/actionBarSize"
+                android:background="@color/colorPrimary"
+                app:popupTheme="@style/AppTheme.PopupOverlay" />
+
+        </com.google.android.material.appbar.AppBarLayout>
+
+        <include
+            layout="@layout/main_map"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="?attr/actionBarSize" />
+
+        <com.google.android.material.floatingactionbutton.FloatingActionButton
+            android:id="@+id/faBtnStart"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|start"
+            android:layout_marginStart="30dp"
+            android:layout_marginBottom="80dp"
+            android:contentDescription="@null"
+            app:elevation="6dp"
+            app:pressedTranslationZ="12dp"
+            app:srcCompat="@drawable/ic_position" />
+
+        <LinearLayout
+            android:id="@+id/search_linear"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#ddffffff"
+            android:visibility="gone"
+            android:layout_marginTop="?attr/actionBarSize">
+            <ListView
+                android:id="@+id/search_list_view"
+                android:layout_width="match_parent"
+                android:layout_margin="10dp"
+                android:layout_height="wrap_content">
+            </ListView>
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/search_history_linear"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#ddffffff"
+            android:visibility="gone"
+            android:layout_marginTop="?attr/actionBarSize">
+            <ListView
+                android:id="@+id/search_history_list_view"
+                android:layout_width="match_parent"
+                android:layout_margin="10dp"
+                android:layout_height="wrap_content">
+            </ListView>
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/route_panel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom"
+            android:background="#e8ffffff"
+            android:orientation="vertical"
+            android:padding="8dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/route_status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/route_status_empty"
+                android:textColor="#222222"
+                android:textSize="13sp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/route_btn_edit"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/route_btn_edit_on"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/route_btn_undo"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/route_btn_undo"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/route_btn_clear"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/route_btn_clear"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <CheckBox
+                    android:id="@+id/route_chk_loop"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checked="true"
+                    android:text="@string/route_chk_loop"
+                    android:textSize="12sp" />
+
+                <CheckBox
+                    android:id="@+id/route_chk_pingpong"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/route_chk_pingpong"
+                    android:textSize="12sp" />
+
+                <EditText
+                    android:id="@+id/route_speed"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:ems="4"
+                    android:hint="@string/route_speed_hint"
+                    android:importantForAutofill="no"
+                    android:inputType="numberDecimal"
+                    android:text="5.0"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/route_btn_start"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/route_btn_start"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/route_btn_pause"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/route_btn_pause"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/route_btn_stop"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/route_btn_stop"
+                    android:textSize="12sp" />
+            </LinearLayout>
+        </LinearLayout>
+
+    </FrameLayout>
+</androidx.coordinatorlayout.widget.CoordinatorLayout>

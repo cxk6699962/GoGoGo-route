@@ -1,0 +1,2542 @@
+# GoGoGo 1.13.0 路线巡航（循环路径）+ 定位高级仿真
+# 基线：https://github.com/zcshou/GoGoGo master
+# 应用：cd GoGoGo-master && git apply -p1 ../out/route-loop.patch
+
+diff --git a/app/build.gradle b/app/build.gradle
+index d188614..1233a1a 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -1,11 +1,9 @@
+ plugins {
+     id "com.android.application"
+     // 谷歌官方推荐的用于隐藏地图 KEY 的插件 https://developers.google.com/maps/documentation/places/android-sdk/secrets-gradle-plugin?hl=zh-cn
+-    id "com.google.android.libraries.mapsplatform.secrets-gradle-plugin"
+ }
+ 
+ android {
+-    ndkVersion = '26.2.11394342'
+     compileSdk = 32
+     buildToolsVersion = '36.0.0'
+     namespace = 'com.zcshou.gogogo'
+@@ -30,8 +28,20 @@ android {
+         minSdkVersion 27
+         //noinspection ExpiredTargetSdkVersion
+         targetSdkVersion 32
+-        versionCode 1123
+-        versionName '1.12.3' // https://semver.org/lang/zh-CN/
++        versionCode 1203
++        versionName '1.13.3' // 1.13.3: 路径点可视化/重叠防护/拖动微调 + 巡航与传送互斥 + 重启瞬移修复
++
++        // 百度地图 AK：优先取 local.properties 中的 MAPS_API_KEY，缺省使用内置值
++        def localProps = new Properties()
++        def localFile = rootProject.file('local.properties')
++        if (localFile.exists()) {
++            localFile.withInputStream { localProps.load(it) }
++        }
++        def mapsAk = localProps.getProperty('MAPS_API_KEY', 'P9I4SjSfRtFenM1hLTyZwoW3YLnmtSda')
++        def mapsSafeCode = localProps.getProperty('MAPS_SAFE_CODE', '')
++        buildConfigField "String", "MAPS_API_KEY", "\"${mapsAk}\""
++        buildConfigField "String", "MAPS_SAFE_CODE", "\"${mapsSafeCode}\""
++        manifestPlaceholders = [MAPS_API_KEY: mapsAk]
+         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+         resourceConfigurations += ['zh', 'zh-rCN', 'en', 'en-rUS']
+         ndk {
+@@ -45,11 +55,11 @@ android {
+         release {
+             // Enables code shrinking, obfuscation, and optimization for only
+             // your project's release build type.
+-            minifyEnabled = true
++            minifyEnabled = false
+ 
+             // Enables resource shrinking, which is performed by the
+             // Android Gradle plugin.
+-            shrinkResources = true
++            shrinkResources = false
+ 
+             // Includes the default ProGuard rules files that are packaged with
+             // the Android Gradle plugin. To learn more, go to the section about
+@@ -94,21 +104,6 @@ android {
+         includeInBundle = false
+     }
+ 
+-    // 指定输出的可执行程序的名字
+-    applicationVariants.configureEach { variant ->
+-        variant.outputs.configureEach { output ->
+-            def outputFile = output.outputFile
+-            if (outputFile != null && outputFile.name.endsWith('.apk')) {
+-                def fileName
+-                if (variant.buildType.name == 'release') {
+-                    fileName = "Go_${defaultConfig.versionName}_arm64-v8a_release.apk"
+-                } else {
+-                    fileName = "Go_${defaultConfig.versionName}_arm64-v8a_debug.apk"
+-                }
+-                outputFileName=fileName
+-            }
+-        }
+-    }
+ }
+ 
+ dependencies {
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 09bf560..bb06982 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -15,6 +15,8 @@
+     <!-- 允许程序改变Wi-Fi连接状态 -->
+     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
++    <!-- 计步传感器（步频联动），Android 10+ 需要该权限 -->
++    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
+     <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+     <uses-permission android:name="android.permission.DOWNLOAD_WITHOUT_NOTIFICATION" />
+@@ -61,6 +63,10 @@
+             android:name="org.apache.http.legacy"
+             android:required="false" />
+ 
++        <meta-data
++            android:name="com.baidu.lbsapi.API_KEY"
++            android:value="${MAPS_API_KEY}" />
++
+         <!-- 百度地图 间隔定位必须配置此service否则功能无效 -->
+         <service
+             android:name="com.baidu.location.f"
+diff --git a/app/src/main/java/com/zcshou/gogogo/FragmentSettings.java b/app/src/main/java/com/zcshou/gogogo/FragmentSettings.java
+index 1e98d04..f63cb77 100644
+--- a/app/src/main/java/com/zcshou/gogogo/FragmentSettings.java
++++ b/app/src/main/java/com/zcshou/gogogo/FragmentSettings.java
+@@ -65,6 +65,27 @@ public class FragmentSettings extends PreferenceFragmentCompat {
+         EditTextPreference pfLonOffset = findPreference("setting_lon_max_offset");
+         setupDecimalEditTextPreference(pfLonOffset);
+ 
++        // 定位高级仿真参数
++        setupDecimalEditTextPreference(findPreference("setting_jitter"));
++        setupDecimalEditTextPreference(findPreference("setting_alt_jitter"));
++        setupDecimalEditTextPreference(findPreference("setting_satellites"));
++
++        // 路线巡航参数
++        setupDecimalEditTextPreference(findPreference("setting_route_speed"));
++        setupDecimalEditTextPreference(findPreference("setting_route_accel"));
++        setupDecimalEditTextPreference(findPreference("setting_route_terrain"));
++
++        setupDecimalEditTextPreference(findPreference("setting_stride"));
++        setupDecimalEditTextPreference(findPreference("setting_loop_offset"));
++        setupDecimalEditTextPreference(findPreference("setting_drift"));
++        setupDecimalEditTextPreference(findPreference("setting_net_interval"));
++
++        ListPreference pfRouteMode = findPreference("setting_route_mode");
++        if (pfRouteMode != null) {
++            pfRouteMode.setSummaryProvider((Preference.SummaryProvider<ListPreference>) preference -> Objects.requireNonNull(preference.getEntry()));
++            pfRouteMode.setOnPreferenceChangeListener((preference, newValue) -> !newValue.toString().trim().isEmpty());
++        }
++
+         SwitchPreferenceCompat pLog = findPreference("setting_log_off");
+         if (pLog != null) {
+             pLog.setOnPreferenceChangeListener((preference, newValue) -> {
+diff --git a/app/src/main/java/com/zcshou/gogogo/MainActivity.java b/app/src/main/java/com/zcshou/gogogo/MainActivity.java
+index 0764110..f8a2f31 100644
+--- a/app/src/main/java/com/zcshou/gogogo/MainActivity.java
++++ b/app/src/main/java/com/zcshou/gogogo/MainActivity.java
+@@ -12,6 +12,11 @@ import android.content.IntentFilter;
+ import android.content.ServiceConnection;
+ import android.content.SharedPreferences;
+ import android.database.Cursor;
++import android.graphics.Bitmap;
++import android.graphics.Canvas;
++import android.graphics.Color;
++import android.graphics.Paint;
++import android.graphics.Typeface;
+ import android.database.sqlite.SQLiteDatabase;
+ import android.hardware.Sensor;
+ import android.hardware.SensorEvent;
+@@ -30,6 +35,7 @@ import android.view.View;
+ import android.view.Window;
+ import android.view.WindowManager;
+ import android.widget.Button;
++import android.widget.CheckBox;
+ import android.widget.EditText;
+ import android.widget.ImageButton;
+ import android.widget.ImageView;
+@@ -63,9 +69,13 @@ import com.baidu.mapapi.map.MapStatus;
+ import com.baidu.mapapi.map.MapStatusUpdate;
+ import com.baidu.mapapi.map.MapStatusUpdateFactory;
+ import com.baidu.mapapi.map.MapView;
++import com.baidu.mapapi.map.Marker;
+ import com.baidu.mapapi.map.MarkerOptions;
++import com.baidu.mapapi.map.Overlay;
+ import com.baidu.mapapi.map.MyLocationConfiguration;
+ import com.baidu.mapapi.map.MyLocationData;
++import com.baidu.mapapi.map.Polyline;
++import com.baidu.mapapi.map.PolylineOptions;
+ import com.baidu.mapapi.model.LatLng;
+ import com.baidu.mapapi.search.core.SearchResult;
+ import com.baidu.mapapi.search.geocode.GeoCodeResult;
+@@ -97,6 +107,8 @@ import com.zcshou.database.DataBaseHistorySearch;
+ import com.zcshou.utils.ShareUtils;
+ import com.zcshou.utils.GoUtils;
+ import com.zcshou.utils.MapUtils;
++import com.zcshou.utils.RoutePath;
++import com.zcshou.utils.RoutePlayer;
+ 
+ import com.elvishew.xlog.XLog;
+ 
+@@ -164,6 +176,38 @@ public class MainActivity extends BaseActivity implements SensorEventListener {
+     private BroadcastReceiver mDownloadBdRcv;
+     private String mUpdateFilename;
+ 
++    /*============================== 路线巡航（循环路径） 相关 ==============================*/
++    private LinearLayout mRoutePanel;
++    private TextView mRouteStatus;
++    private Button mRouteBtnEdit;
++    private Button mRouteBtnUndo;
++    private Button mRouteBtnClear;
++    private Button mRouteBtnStart;
++    private Button mRouteBtnPause;
++    private Button mRouteBtnStop;
++    private CheckBox mRouteLoop;
++    private CheckBox mRoutePingPong;
++    private EditText mRouteSpeed;
++    private Polyline mRouteLine = null;
++    private final List<Marker> mRouteMarkers = new ArrayList<>();
++    private final java.util.Map<String, BitmapDescriptor> mRouteIconCache = new HashMap<>();
++    /** 相邻路径点的最小间距（米），小于该值视为重叠点 */
++    private static final double MIN_POINT_GAP_M = 3.0;
++    private BroadcastReceiver mRouteReceiver;
++    private final List<LatLng> mRoutePoints = new ArrayList<>();
++    private boolean isRouteEdit = false;
++    private boolean isRoutePlaying = false;
++    private boolean isRoutePaused = false;
++    private boolean mPendingRouteStart = false;
++    private List<double[]> mPendingWgs = null;
++    private int mPendingMode = RoutePlayer.MODE_LOOP;
++    private double mPendingSpeed = 5.0;
++    private double mPendingAccel = 1.2;
++    private double mPendingTerrain = 1.5;
++    private double mPendingTerrainPeriod = 500.0;
++    private double mPendingLapOffset = 1.2;
++    private double mPendingDrift = 0.25;
++
+     @Override
+     protected void onCreate(Bundle savedInstanceState) {
+         super.onCreate(savedInstanceState);
+@@ -193,10 +237,18 @@ public class MainActivity extends BaseActivity implements SensorEventListener {
+ 
+         initGoBtn();
+ 
++        initRoute();
++
++        initRouteReceiver();
++
+         mConnection = new ServiceConnection() {
+             @Override
+             public void onServiceConnected(ComponentName name, IBinder service) {
+                 mServiceBinder = (ServiceGo.ServiceGoBinder)service;
++                if (mPendingRouteStart) {
++                    mPendingRouteStart = false;
++                    applyRouteStart();
++                }
+             }
+ 
+             @Override
+@@ -249,6 +301,9 @@ public class MainActivity extends BaseActivity implements SensorEventListener {
+             stopService(serviceGoIntent);
+         }
+         unregisterReceiver(mDownloadBdRcv);
++        if (mRouteReceiver != null) {
++            unregisterReceiver(mRouteReceiver);
++        }
+ 
+         mSensorManager.unregisterListener(this);
+ 
+@@ -383,6 +438,15 @@ public class MainActivity extends BaseActivity implements SensorEventListener {
+         return true;
+     }
+ 
++    @Override
++    public boolean onOptionsItemSelected(@NonNull MenuItem item) {
++        if (item.getItemId() == R.id.action_route) {
++            toggleRoutePanel();
++            return true;
++        }
++        return super.onOptionsItemSelected(item);
++    }
++
+     @Override
+     public void onSensorChanged(SensorEvent sensorEvent) {
+         if(sensorEvent.sensor.getType() == Sensor.TYPE_ACCELEROMETER){
+@@ -470,6 +534,10 @@ public class MainActivity extends BaseActivity implements SensorEventListener {
+              */
+             @Override
+             public void onMapClick(LatLng point) {
++                if (isRouteEdit) {
++                    addRoutePoint(point);
++                    return;
++                }
+                 mMarkLatLngMap = point;
+                 markMap();
+             }
+@@ -482,6 +550,30 @@ public class MainActivity extends BaseActivity implements SensorEventListener {
+                 markMap();
+             }
+         });
++        // 路径点可拖动微调
++        mBaiduMap.setOnMarkerDragListener(new BaiduMap.OnMarkerDragListener() {
++            @Override
++            public void onMarkerDragStart(Marker marker) {
++            }
++
++            @Override
++            public void onMarkerDrag(Marker marker) {
++            }
++
++            @Override
++            public void onMarkerDragEnd(Marker marker) {
++                int idx = mRouteMarkers.indexOf(marker);
++                if (idx < 0 || idx >= mRoutePoints.size()) {
++                    return;
++                }
++                mRoutePoints.set(idx, marker.getPosition());
++                sanitizeRoute();
++                persistRoute();
++                drawRoute();
++                updateRouteStatus();
++            }
++        });
++
+         mBaiduMap.setOnMapLongClickListener(new BaiduMap.OnMapLongClickListener() {
+             /**
+              * 长按地图
+@@ -650,7 +742,7 @@ public class MainActivity extends BaseActivity implements SensorEventListener {
+         //可选，默认false，设置是否需要POI结果，可以在BDLocation.getPoiList里得到
+         locationOption.setIsNeedLocationPoiList(false);
+         //可选，默认false，设置是否收集CRASH信息，默认收集
+-        locationOption.setIgnoreCacheException(true);
++        locationOption.SetIgnoreCacheException(true);
+         //可选，默认false，设置是否开启Gps定位
+         //locationOption.setOpenGps(true);
+         locationOption.setOpenGnss(true);
+@@ -740,12 +832,18 @@ public class MainActivity extends BaseActivity implements SensorEventListener {
+         if (mMarkLatLngMap != null) {
+             MarkerOptions ooA = new MarkerOptions().position(mMarkLatLngMap).icon(mMapIndicator);
+             mBaiduMap.clear();
++            mRouteLine = null;              // clear() 会移除所有 overlay，引用同步失效
++            mRouteMarkers.clear();
+             mBaiduMap.addOverlay(ooA);
++            drawRoute();                    // 重新画路径，避免"路径丢了
++
+         }
+     }
+ 
+     private void resetMap() {
+         mBaiduMap.clear();
++        mRouteLine = null;
++        mRouteMarkers.clear();
+         mMarkLatLngMap = null;
+ 
+         MyLocationData locData = new MyLocationData.Builder()
+@@ -758,6 +856,7 @@ public class MainActivity extends BaseActivity implements SensorEventListener {
+         MapStatus.Builder builder = new MapStatus.Builder();
+         builder.target(new LatLng(mCurrentLat, mCurrentLon)).zoom(18.0f);
+         mBaiduMap.animateMapStatus(MapStatusUpdateFactory.newMapStatus(builder.build()));
++        drawRoute();
+     }
+ 
+     // 在地图上显示位置
+@@ -810,6 +909,11 @@ public class MainActivity extends BaseActivity implements SensorEventListener {
+     }
+ 
+     private void doGoLocation(View v) {
++        if (isRouteEdit) {
++            GoUtils.DisplayToast(this, getResources().getString(R.string.route_edit_blocked));
++            return;
++        }
++
+         if (!GoUtils.isNetworkAvailable(this)) {
+             GoUtils.DisplayToast(this, getResources().getString(R.string.app_error_network));
+             return;
+@@ -1281,4 +1385,477 @@ public class MainActivity extends BaseActivity implements SensorEventListener {
+             startActivity(intent);
+         }
+     }
++
++    /*============================== 路线巡航（循环路径） 实现 ==============================*/
++    private void initRoute() {
++        mRoutePanel = findViewById(R.id.route_panel);
++        mRouteStatus = findViewById(R.id.route_status);
++        mRouteBtnEdit = findViewById(R.id.route_btn_edit);
++        mRouteBtnUndo = findViewById(R.id.route_btn_undo);
++        mRouteBtnClear = findViewById(R.id.route_btn_clear);
++        mRouteBtnStart = findViewById(R.id.route_btn_start);
++        mRouteBtnPause = findViewById(R.id.route_btn_pause);
++        mRouteBtnStop = findViewById(R.id.route_btn_stop);
++        mRouteLoop = findViewById(R.id.route_chk_loop);
++        mRoutePingPong = findViewById(R.id.route_chk_pingpong);
++        mRouteSpeed = findViewById(R.id.route_speed);
++
++        // 恢复上次保存的路线（BD09 坐标）
++        mRoutePoints.clear();
++        List<RoutePath.Point> saved = RoutePath.decode(sharedPreferences.getString("setting_route_points", ""));
++        for (RoutePath.Point p : saved) {
++            mRoutePoints.add(new LatLng(p.lat, p.lng));
++        }
++        sanitizeRoute();
++        if (!mRoutePoints.isEmpty()) {
++            persistRoute();     // 把清理后的结果写回，避免下次启动继续读到重叠点
++        }
++        drawRoute();
++        updateRouteStatus();
++
++        String speedStr = sharedPreferences.getString("setting_route_speed", "5.0");
++        mRouteSpeed.setText(speedStr);
++
++        mRouteBtnEdit.setOnClickListener(v -> {
++            isRouteEdit = !isRouteEdit;
++            mRouteBtnEdit.setText(isRouteEdit ? R.string.route_btn_edit_off : R.string.route_btn_edit_on);
++            if (isRouteEdit) {
++                GoUtils.DisplayToast(this, getResources().getString(R.string.route_tips_add_point));
++            }
++        });
++
++        mRouteBtnUndo.setOnClickListener(v -> {
++            if (!mRoutePoints.isEmpty()) {
++                mRoutePoints.remove(mRoutePoints.size() - 1);
++                sanitizeRoute();
++                persistRoute();
++                drawRoute();
++                updateRouteStatus();
++            }
++        });
++
++        mRouteBtnClear.setOnClickListener(v -> {
++            mRoutePoints.clear();
++            persistRoute();
++            drawRoute();
++            updateRouteStatus();
++        });
++
++        mRouteLoop.setOnCheckedChangeListener((buttonView, isChecked) -> {
++            if (isChecked && mRoutePingPong.isChecked()) {
++                mRoutePingPong.setChecked(false);
++            }
++            if (isChecked && mServiceBinder != null && isRoutePlaying) {
++                mServiceBinder.pauseRoute(true);
++            }
++        });
++
++        mRoutePingPong.setOnCheckedChangeListener((buttonView, isChecked) -> {
++            if (isChecked && mRouteLoop.isChecked()) {
++                mRouteLoop.setChecked(false);
++            }
++        });
++
++        mRouteBtnStart.setOnClickListener(v -> startRouteCruise());
++
++        mRouteBtnPause.setOnClickListener(v -> {
++            if (mServiceBinder == null || !isRoutePlaying) {
++                return;
++            }
++            isRoutePaused = !isRoutePaused;
++            mServiceBinder.pauseRoute(isRoutePaused);
++            mRouteBtnPause.setText(isRoutePaused ? R.string.route_btn_resume : R.string.route_btn_pause);
++            if (isRoutePaused) {
++                GoUtils.DisplayToast(this, getResources().getString(R.string.route_paused));
++            }
++        });
++
++        mRouteBtnStop.setOnClickListener(v -> stopRouteCruise(true));
++    }
++
++    /** 监听服务回传的巡航进度，用于地图与状态同步 */
++    private void initRouteReceiver() {
++        mRouteReceiver = new BroadcastReceiver() {
++            @Override
++            public void onReceive(Context context, Intent intent) {
++                if (!ServiceGo.ACTION_ROUTE_PROGRESS.equals(intent.getAction())) {
++                    return;
++                }
++                double lng = intent.getDoubleExtra(ServiceGo.EXTRA_ROUTE_LNG, 0.0);
++                double lat = intent.getDoubleExtra(ServiceGo.EXTRA_ROUTE_LAT, 0.0);
++                float speed = (float) intent.getDoubleExtra(ServiceGo.EXTRA_ROUTE_SPEED, 0.0);
++                float bearing = (float) intent.getDoubleExtra(ServiceGo.EXTRA_ROUTE_BEARING, 0.0);
++                double progress = intent.getDoubleExtra(ServiceGo.EXTRA_ROUTE_PROGRESS, 0.0);
++                int lap = intent.getIntExtra(ServiceGo.EXTRA_ROUTE_LAP, 1);
++                boolean finished = intent.getBooleanExtra(ServiceGo.EXTRA_ROUTE_FINISHED, false);
++
++                double[] bd = MapUtils.wgs2bd09(lng, lat);
++
++                if (mBaiduMap != null) {
++                    MyLocationData locData = new MyLocationData.Builder()
++                            .accuracy(6.0f)
++                            .direction(bearing)
++                            .latitude(bd[1])
++                            .longitude(bd[0])
++                            .build();
++                    mBaiduMap.setMyLocationData(locData);
++                }
++
++                if (mRouteStatus != null && mRoutePanel.getVisibility() == View.VISIBLE) {
++                    mRouteStatus.setText(getString(R.string.route_running_fmt, speed, progress * 100.0, Math.max(1, lap)));
++                }
++
++                if (finished) {
++                    isRoutePlaying = false;
++                    isRoutePaused = false;
++                    mRouteBtnPause.setText(R.string.route_btn_pause);
++                    updateRouteStatus();
++                    GoUtils.DisplayToast(MainActivity.this, getResources().getString(R.string.route_finished));
++                }
++            }
++        };
++        registerReceiver(mRouteReceiver, new IntentFilter(ServiceGo.ACTION_ROUTE_PROGRESS));
++    }
++
++    private void toggleRoutePanel() {
++        if (mRoutePanel == null) {
++            return;
++        }
++        if (mRoutePanel.getVisibility() == View.VISIBLE) {
++            mRoutePanel.setVisibility(View.GONE);
++            mButtonStart.setVisibility(View.VISIBLE);
++            isRouteEdit = false;
++            mRouteBtnEdit.setText(R.string.route_btn_edit_on);
++            notifyJoystick(true);
++        } else {
++            mRoutePanel.setVisibility(View.VISIBLE);
++            mButtonStart.setVisibility(View.GONE);
++            isRouteEdit = false;
++            mRouteBtnEdit.setText(R.string.route_btn_edit_on);
++            updateRouteStatus();
++            notifyJoystick(false);   // 面板占住底部，先把摇杆收起来
++        }
++    }
++
++    /** 通知服务显示/隐藏悬浮摇杆，避免两个控制面重叠 */
++    private void notifyJoystick(boolean show) {
++        if (!isMockServStart) {
++            return;
++        }
++        try {
++            sendBroadcast(new Intent(show ? ServiceGo.ACTION_JOYSTICK_SHOW : ServiceGo.ACTION_JOYSTICK_HIDE));
++        } catch (Exception e) {
++            XLog.e("ERROR: notifyJoystick");
++        }
++    }
++
++    private void updateRouteStatus() {
++        if (mRouteStatus == null) {
++            return;
++        }
++        if (mRoutePoints.isEmpty()) {
++            mRouteStatus.setText(R.string.route_status_empty);
++            return;
++        }
++        double len = 0.0;
++        for (int i = 1; i < mRoutePoints.size(); i++) {
++            len += distanceMeterBd(mRoutePoints.get(i - 1), mRoutePoints.get(i));
++        }
++        mRouteStatus.setText(getString(R.string.route_status_fmt, mRoutePoints.size(), len));
++    }
++
++    /** BD09 两点近似距离（米），仅用于界面显示 */
++    private static double distanceMeterBd(LatLng a, LatLng b) {
++        return RoutePath.distanceMeter(new RoutePath.Point(a.longitude, a.latitude, 0.0, 0.0),
++                new RoutePath.Point(b.longitude, b.latitude, 0.0, 0.0));
++    }
++
++    /**
++     * 重绘路径：先清掉旧的标记点，再按序号重新画圆点（起点绿、终点红、中间蓝），
++     * 最后更新折线。宁可全量重画，也不留下失效的 overlay 引用。
++     */
++    private void drawRoute() {
++        if (mBaiduMap == null) {
++            return;
++        }
++        try {
++            for (Marker m : mRouteMarkers) {
++                if (m != null && !m.isRemoved()) {
++                    m.remove();
++                }
++            }
++            mRouteMarkers.clear();
++
++            int total = mRoutePoints.size();
++            for (int i = 0; i < total; i++) {
++                MarkerOptions mo = new MarkerOptions()
++                        .position(mRoutePoints.get(i))
++                        .icon(routeDotIcon(i, total))
++                        .anchor(0.5f, 0.5f)
++                        .draggable(true);
++                Overlay overlay = mBaiduMap.addOverlay(mo);
++                if (overlay instanceof Marker) {
++                    mRouteMarkers.add((Marker) overlay);
++                }
++            }
++
++            if (total < 2) {
++                if (mRouteLine != null) {
++                    mRouteLine.remove();
++                    mRouteLine = null;
++                }
++                return;
++            }
++
++            List<LatLng> pts = new ArrayList<>(mRoutePoints);
++            if (mRouteLine == null) {
++                PolylineOptions options = new PolylineOptions().width(12).color(0xCC1E88E5).points(pts);
++                mRouteLine = (Polyline) mBaiduMap.addOverlay(options);
++            } else {
++                mRouteLine.setPoints(pts);
++            }
++        } catch (Exception e) {
++            XLog.e("ERROR: drawRoute");
++        }
++    }
++
++    /** 生成带序号的圆点图标（带缓存），起点绿 / 终点红 / 中间蓝 */
++    private BitmapDescriptor routeDotIcon(int index, int total) {
++        String key = (index == 0 ? "s" : (index == total - 1 ? "e" : "n")) + index + "_" + total;
++        BitmapDescriptor cached = mRouteIconCache.get(key);
++        if (cached != null) {
++            return cached;
++        }
++
++        int size = 72;
++        Bitmap bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
++        Canvas canvas = new Canvas(bmp);
++
++        Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
++        paint.setColor(index == 0 ? 0xFF2E7D32 : (index == total - 1 ? 0xFFC62828 : 0xFF1565C0));
++        canvas.drawCircle(size / 2.0f, size / 2.0f, size / 2.0f - 4, paint);
++
++        Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
++        ring.setStyle(Paint.Style.STROKE);
++        ring.setStrokeWidth(4f);
++        ring.setColor(Color.WHITE);
++        canvas.drawCircle(size / 2.0f, size / 2.0f, size / 2.0f - 6, ring);
++
++        Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
++        text.setColor(Color.WHITE);
++        text.setTextSize(total > 99 ? 30f : 36f);
++        text.setTypeface(Typeface.DEFAULT_BOLD);
++        text.setTextAlign(Paint.Align.CENTER);
++        String label = total > 99 ? "•" : String.valueOf(index + 1);
++        float ty = size / 2.0f - (text.descent() + text.ascent()) / 2.0f;
++        canvas.drawText(label, size / 2.0f, ty, text);
++
++        BitmapDescriptor desc = BitmapDescriptorFactory.fromBitmap(bmp);
++        mRouteIconCache.put(key, desc);
++        return desc;
++    }
++
++    /** 新增路径点：与上一个点距离过近（重叠）时拒绝，避免零长度段 */
++    private void addRoutePoint(LatLng point) {
++        if (!mRoutePoints.isEmpty()
++                && distanceMeterBd(mRoutePoints.get(mRoutePoints.size() - 1), point) < MIN_POINT_GAP_M) {
++            GoUtils.DisplayToast(this, getResources().getString(R.string.route_point_too_close));
++            return;
++        }
++        mRoutePoints.add(point);
++        sanitizeRoute();
++        persistRoute();
++        drawRoute();
++        updateRouteStatus();
++    }
++
++    /** 清理重叠点 / 首尾重复点（续接时顺序保持不变） */
++    private void sanitizeRoute() {
++        List<LatLng> out = new ArrayList<>();
++        for (LatLng p : mRoutePoints) {
++            if (p == null) {
++                continue;
++            }
++            if (!out.isEmpty() && distanceMeterBd(out.get(out.size() - 1), p) < MIN_POINT_GAP_M) {
++                continue;
++            }
++            out.add(p);
++        }
++        while (out.size() > 2 && distanceMeterBd(out.get(0), out.get(out.size() - 1)) < MIN_POINT_GAP_M) {
++            out.remove(out.size() - 1);
++        }
++        if (out.size() != mRoutePoints.size()) {
++            mRoutePoints.clear();
++            mRoutePoints.addAll(out);
++        }
++    }
++
++    private void persistRoute() {
++        List<RoutePath.Point> pts = new ArrayList<>();
++        for (LatLng p : mRoutePoints) {
++            pts.add(new RoutePath.Point(p.longitude, p.latitude, 0.0, 0.0));
++        }
++        sharedPreferences.edit().putString("setting_route_points", RoutePath.encode(pts)).apply();
++    }
++
++    private void startRouteCruise() {
++        if (isRoutePlaying) {
++            stopRouteCruise(false);     // 先停掉上一轮，避免两个播放器叠加
++        }
++
++        sanitizeRoute();
++        if (mRoutePoints.size() < 2) {
++            GoUtils.DisplayToast(this, getResources().getString(R.string.route_need_points));
++            return;
++        }
++
++        if (!GoUtils.isGpsOpened(this)) {
++            GoUtils.showEnableGpsDialog(this);
++            return;
++        }
++
++        if (!Settings.canDrawOverlays(getApplicationContext())) {
++            GoUtils.showEnableFloatWindowDialog(this);
++            return;
++        }
++
++        double speed = 5.0;
++        try {
++            speed = Double.parseDouble(mRouteSpeed.getText().toString().trim());
++        } catch (Exception e) {
++            GoUtils.DisplayToast(this, getResources().getString(R.string.route_invalid_speed));
++        }
++        if (speed < 0.2) {
++            speed = 0.2;
++        }
++        if (speed > 120.0) {
++            speed = 120.0;
++        }
++
++        double accel = 1.2;
++        double terrain = 1.5;
++        double terrainPeriod = 500.0;
++        try {
++            accel = Double.parseDouble(sharedPreferences.getString("setting_route_accel", "1.2"));
++        } catch (Exception ignored) {
++        }
++        try {
++            terrain = Double.parseDouble(sharedPreferences.getString("setting_route_terrain", "1.5"));
++        } catch (Exception ignored) {
++        }
++
++        double lapOffset = 1.2;
++        double drift = 0.25;
++        try {
++            lapOffset = Double.parseDouble(sharedPreferences.getString("setting_loop_offset", "1.2"));
++        } catch (Exception ignored) {
++        }
++        try {
++            drift = Double.parseDouble(sharedPreferences.getString("setting_drift", "0.25"));
++        } catch (Exception ignored) {
++        }
++        lapOffset = Math.max(0.0, Math.min(10.0, lapOffset));
++        drift = Math.max(0.0, Math.min(5.0, drift));
++
++        // 步频驱动需要 ACTIVITY_RECOGNITION 权限（Android 10+）
++        if (sharedPreferences.getBoolean("setting_step_drive", false)
++                && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q
++                && checkSelfPermission(android.Manifest.permission.ACTIVITY_RECOGNITION)
++                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
++            requestPermissions(new String[] {android.Manifest.permission.ACTIVITY_RECOGNITION}, 1001);
++        }
++
++        int mode = RoutePlayer.MODE_LOOP;
++        if (mRoutePingPong.isChecked()) {
++            mode = RoutePlayer.MODE_PINGPONG;
++        } else if (!mRouteLoop.isChecked()) {
++            mode = RoutePlayer.MODE_ONCE;
++        }
++
++        double alt = 55.0;
++        try {
++            alt = Double.parseDouble(sharedPreferences.getString("setting_altitude", "55.0"));
++        } catch (Exception ignored) {
++        }
++
++        // 防瞬移：当前位置离起点较远时，先把当前位置插入为第 0 点，
++        // 否则一开跑就会从真实/上次位置瞬间跳到起点，看起来像"乱跑"
++        if (mCurrentLat != 0.0 && mCurrentLon != 0.0) {
++            LatLng cur = new LatLng(mCurrentLat, mCurrentLon);
++            if (distanceMeterBd(cur, mRoutePoints.get(0)) > 30.0) {
++                mRoutePoints.add(0, cur);
++                sanitizeRoute();
++                persistRoute();
++                drawRoute();
++                updateRouteStatus();
++                GoUtils.DisplayToast(this, getResources().getString(R.string.route_insert_current));
++            }
++        }
++
++        List<double[]> wgs = new ArrayList<>();
++        for (LatLng p : mRoutePoints) {
++            double[] w = MapUtils.bd2wgs(p.longitude, p.latitude);
++            wgs.add(new double[] {w[0], w[1], alt, 0.0});
++        }
++
++        mPendingWgs = wgs;
++        mPendingMode = mode;
++        mPendingSpeed = speed;
++        mPendingAccel = accel;
++        mPendingTerrain = terrain;
++        mPendingTerrainPeriod = terrainPeriod;
++        mPendingLapOffset = lapOffset;
++        mPendingDrift = drift;
++
++        sharedPreferences.edit()
++                .putString("setting_route_speed", String.valueOf(speed))
++                .apply();
++
++        if (!isMockServStart) {
++            mMarkLatLngMap = mRoutePoints.get(0);
++            startGoLocation();
++            mButtonStart.setImageResource(R.drawable.ic_fly);
++            if (GoUtils.isWifiEnabled(this)) {
++                GoUtils.showDisableWifiDialog(MainActivity.this);
++            }
++        }
++
++        isRoutePlaying = true;
++        isRoutePaused = false;
++        mRouteBtnPause.setText(R.string.route_btn_pause);
++
++        if (mServiceBinder != null) {
++            applyRouteStart();
++        } else {
++            mPendingRouteStart = true;
++        }
++
++        GoUtils.DisplayToast(this, getResources().getString(R.string.route_started));
++    }
++
++    private void applyRouteStart() {
++        if (mServiceBinder == null || mPendingWgs == null) {
++            return;
++        }
++        boolean ok = mServiceBinder.startRoute(mPendingWgs, mPendingMode, mPendingSpeed,
++                mPendingAccel, mPendingTerrain, mPendingTerrainPeriod,
++                mPendingLapOffset, mPendingDrift);
++        if (!ok) {
++            isRoutePlaying = false;
++            GoUtils.DisplayToast(this, getResources().getString(R.string.route_need_points));
++        }
++    }
++
++    private void stopRouteCruise(boolean showToast) {
++        if (mServiceBinder != null) {
++            mServiceBinder.stopRoute();
++        }
++        isRoutePlaying = false;
++        isRoutePaused = false;
++        mRouteBtnPause.setText(R.string.route_btn_pause);
++        if (showToast) {
++            GoUtils.DisplayToast(this, getResources().getString(R.string.route_stopped));
++        }
++    }
++
+ }
+diff --git a/app/src/main/java/com/zcshou/service/ServiceGo.java b/app/src/main/java/com/zcshou/service/ServiceGo.java
+index 6218cac..867983f 100644
+--- a/app/src/main/java/com/zcshou/service/ServiceGo.java
++++ b/app/src/main/java/com/zcshou/service/ServiceGo.java
+@@ -10,6 +10,7 @@ import android.content.BroadcastReceiver;
+ import android.content.Context;
+ import android.content.Intent;
+ import android.content.IntentFilter;
++import android.content.SharedPreferences;
+ import android.location.Criteria;
+ import android.location.Location;
+ import android.location.LocationManager;
+@@ -23,16 +24,27 @@ import android.os.IBinder;
+ import android.os.Message;
+ import android.os.Process;
+ import android.os.SystemClock;
++import android.hardware.Sensor;
++import android.hardware.SensorEvent;
++import android.hardware.SensorEventListener;
++import android.hardware.SensorManager;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.core.app.NotificationCompat;
++import androidx.preference.PreferenceManager;
+ 
+ import com.elvishew.xlog.XLog;
+ import com.zcshou.gogogo.MainActivity;
+ import com.zcshou.gogogo.R;
+ import com.zcshou.joystick.JoyStick;
++import com.zcshou.utils.RoutePath;
++import com.zcshou.utils.RoutePlayer;
+ 
+-public class ServiceGo extends Service {
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Random;
++
++public class ServiceGo extends Service implements SensorEventListener {
+     // 定位相关变量
+     public static final double DEFAULT_LAT = 36.667662;
+     public static final double DEFAULT_LNG = 117.027707;
+@@ -53,12 +65,51 @@ public class ServiceGo extends Service {
+     private static final int SERVICE_GO_NOTE_ID = 1;
+     private static final String SERVICE_GO_NOTE_ACTION_JOYSTICK_SHOW = "ShowJoyStick";
+     private static final String SERVICE_GO_NOTE_ACTION_JOYSTICK_HIDE = "HideJoyStick";
++    /** 供界面调用：收起/展开悬浮摇杆，避免与路线面板互相遮挡 */
++    public static final String ACTION_JOYSTICK_SHOW = SERVICE_GO_NOTE_ACTION_JOYSTICK_SHOW;
++    public static final String ACTION_JOYSTICK_HIDE = SERVICE_GO_NOTE_ACTION_JOYSTICK_HIDE;
+     private static final String SERVICE_GO_NOTE_CHANNEL_ID = "SERVICE_GO_NOTE";
+     private static final String SERVICE_GO_NOTE_CHANNEL_NAME = "SERVICE_GO_NOTE";
+     private NoteActionReceiver mActReceiver;
+     // 摇杆相关
+     private JoyStick mJoyStick;
+ 
++    /*============================== 循环路径（路线巡航） ==============================*/
++    /** 路线位置进度广播 */
++    public static final String ACTION_ROUTE_PROGRESS = "com.zcshou.service.ROUTE_PROGRESS";
++    public static final String EXTRA_ROUTE_LNG = "route_lng";
++    public static final String EXTRA_ROUTE_LAT = "route_lat";
++    public static final String EXTRA_ROUTE_SPEED = "route_speed";
++    public static final String EXTRA_ROUTE_BEARING = "route_bearing";
++    public static final String EXTRA_ROUTE_ALT = "route_alt";
++    public static final String EXTRA_ROUTE_PROGRESS = "route_progress";
++    public static final String EXTRA_ROUTE_LAP = "route_lap";
++    public static final String EXTRA_ROUTE_FINISHED = "route_finished";
++    private RoutePlayer mRoutePlayer = null;
++    private RoutePlayer.Pose mRoutePose = null;
++    private long mLastTickMs = 0L;
++
++    /*============================== 定位高级仿真 ==============================*/
++    private final Random mRandom = new Random();
++    private SharedPreferences mPrefs;
++    private long mPrefsStamp = 0L;
++    private boolean mAdvSim = true;          // 高级仿真总开关
++    private double mJitterMeter = 0.6;       // 位置抖动幅度（米）
++    private int mSatellites = 12;            // 模拟卫星数
++    private double mAltJitter = 0.35;        // 海拔抖动（米）
++    private double mBaseAlt = DEFAULT_ALT;   // 基准海拔
++    private long mLastGpsTs = 0L;            // 保证时间戳单调递增
++
++    /*============================== 步频驱动 / 上报节流 ==============================*/
++    private SensorManager mSensorManager = null;
++    private Sensor mStepSensor = null;
++    private float mLastStepCount = -1.0f;
++    private float mLastStepCountNow = -1.0f;
++    private boolean mStepDrive = false;      // 用真实计步推进（步数与距离自洽）
++    private double mStride = 1.05;           // 步幅（米/步）
++    private int mNetInterval = 6;            // 网络 provider 每隔多少帧上报一次
++    private long mTickCounter = 0L;
++
+     private final ServiceGoBinder mBinder = new ServiceGoBinder();
+ 
+     @Override
+@@ -70,6 +121,9 @@ public class ServiceGo extends Service {
+     public void onCreate() {
+         super.onCreate();
+ 
++        mPrefs = PreferenceManager.getDefaultSharedPreferences(this);
++        reloadAdvancedSettings();
++
+         mLocManager = (LocationManager) this.getSystemService(Context.LOCATION_SERVICE);
+ 
+         removeTestProviderNetwork();
+@@ -83,13 +137,18 @@ public class ServiceGo extends Service {
+         initNotification();
+ 
+         initJoyStick();
++
++        initStepSensor();
+     }
+ 
+     @Override
+     public int onStartCommand(Intent intent, int flags, int startId) {
+-        mCurLng = intent.getDoubleExtra(MainActivity.LNG_MSG_ID, DEFAULT_LNG);
+-        mCurLat = intent.getDoubleExtra(MainActivity.LAT_MSG_ID, DEFAULT_LAT);
+-        mCurAlt = intent.getDoubleExtra(MainActivity.ALT_MSG_ID, DEFAULT_ALT);
++        if (intent != null) {
++            mCurLng = intent.getDoubleExtra(MainActivity.LNG_MSG_ID, DEFAULT_LNG);
++            mCurLat = intent.getDoubleExtra(MainActivity.LAT_MSG_ID, DEFAULT_LAT);
++            mCurAlt = intent.getDoubleExtra(MainActivity.ALT_MSG_ID, DEFAULT_ALT);
++            mBaseAlt = mCurAlt;
++        }
+ 
+         mJoyStick.setCurrentPosition(mCurLng, mCurLat, mCurAlt);
+ 
+@@ -102,6 +161,12 @@ public class ServiceGo extends Service {
+         mLocHandler.removeMessages(HANDLER_MSG_ID);
+         mLocHandlerThread.quit();
+ 
++        mRoutePlayer = null;
++
++        if (mSensorManager != null) {
++            mSensorManager.unregisterListener(this);
++        }
++
+         mJoyStick.destroy();
+ 
+         removeTestProviderNetwork();
+@@ -153,6 +218,11 @@ public class ServiceGo extends Service {
+         mJoyStick.setListener(new JoyStick.JoyStickClickListener() {
+             @Override
+             public void onMoveInfo(double speed, double disLng, double disLat, double angle) {
++                // 手动摇杆接管：自动退出路线巡航，避免两者互相覆盖
++                if (mRoutePlayer != null) {
++                    mRoutePlayer = null;
++                    XLog.i("SERVICEGO: 手动摇杆接管，路线巡航停止");
++                }
+                 mSpeed = speed;
+                 // 根据当前的经纬度和距离，计算下一个经纬度
+                 // Latitude: 1 deg = 110.574 km // 纬度的每度的距离大约为 110.574km
+@@ -168,6 +238,7 @@ public class ServiceGo extends Service {
+                 mCurLng = lng;
+                 mCurLat = lat;
+                 mCurAlt = alt;
++                mBaseAlt = alt;
+             }
+         });
+         mJoyStick.show();
+@@ -187,6 +258,18 @@ public class ServiceGo extends Service {
+                     Thread.sleep(100);
+ 
+                     if (!isStop) {
++                        // 用真实经过时间推进，避免线程调度抖动造成速度失真
++                        long now = SystemClock.elapsedRealtime();
++                        double dt = mLastTickMs == 0L ? 0.1 : (now - mLastTickMs) / 1000.0;
++                        mLastTickMs = now;
++                        if (dt <= 0 || dt > 2.0) {
++                            dt = 0.1;
++                        }
++
++                        mTickCounter++;
++
++                        advanceRoute(dt);
++
+                         setLocationNetwork();
+                         setLocationGPS();
+ 
+@@ -202,6 +285,152 @@ public class ServiceGo extends Service {
+         mLocHandler.sendEmptyMessage(HANDLER_MSG_ID);
+     }
+ 
++    /**
++     * 推进路线巡航，并把结果写回当前模拟位置。
++     * <p>
++     * 时间驱动：按真实耗时前进（默认）。
++     * 步频驱动：按真实计步增量 × 步幅前进，左右脚连续性与步数校验都能对上。
++     */
++    private void advanceRoute(double dt) {
++        if (mRoutePlayer == null) {
++            return;
++        }
++
++        RoutePlayer.Pose pose;
++        if (mStepDrive && mStepSensor != null) {
++            float now = mLastStepCountNow;
++            if (now < 0) {
++                return;                 // 还没收到步数事件，位置先不动
++            }
++            if (mLastStepCount < 0) {
++                mLastStepCount = now;   // 第一次只记录基线，绝不拿累计值当增量
++                return;
++            }
++            float delta = now - mLastStepCount;
++            mLastStepCount = now;
++            if (delta < 0 || delta > 50) {
++                delta = 0;              // 传感器重启/异常，忽略该帧
++            }
++            double meters = delta * mStride;
++            if (meters < 0.01) {
++                return;         // 本帧没走，位置不动
++            }
++            pose = mRoutePlayer.advanceMeters(meters);
++            mSpeed = meters / Math.max(dt, 0.05);
++        } else {
++            pose = mRoutePlayer.tick(dt);
++        }
++        if (pose == null) {
++            return;
++        }
++        mRoutePose = pose;
++
++        mCurLng = pose.lng;
++        mCurLat = pose.lat;
++        mCurBea = (float) pose.bearing;
++        mSpeed = pose.speed;
++        mCurAlt = mBaseAlt + pose.alt;
++
++        Intent intent = new Intent(ACTION_ROUTE_PROGRESS);
++        intent.putExtra(EXTRA_ROUTE_LNG, pose.lng);
++        intent.putExtra(EXTRA_ROUTE_LAT, pose.lat);
++        intent.putExtra(EXTRA_ROUTE_SPEED, pose.speed);
++        intent.putExtra(EXTRA_ROUTE_BEARING, pose.bearing);
++        intent.putExtra(EXTRA_ROUTE_ALT, mCurAlt);
++        intent.putExtra(EXTRA_ROUTE_PROGRESS, pose.progress);
++        intent.putExtra(EXTRA_ROUTE_LAP, pose.lap);
++        intent.putExtra(EXTRA_ROUTE_FINISHED, pose.finished);
++        sendBroadcast(intent);
++
++        if (pose.finished) {
++            XLog.i("SERVICEGO: 路线巡航结束");
++            mRoutePlayer = null;
++        }
++    }
++
++    /*============================== 定位高级仿真 ==============================*/
++    private void reloadAdvancedSettings() {
++        try {
++            mAdvSim = mPrefs.getBoolean("setting_adv_sim", true);
++
++            String jitter = mPrefs.getString("setting_jitter", "0.6");
++            mJitterMeter = Math.max(0.0, Math.min(50.0, Double.parseDouble(jitter)));
++
++            String sat = mPrefs.getString("setting_satellites", "12");
++            mSatellites = Math.max(4, Math.min(32, Integer.parseInt(sat)));
++
++            String altJ = mPrefs.getString("setting_alt_jitter", "0.35");
++            mAltJitter = Math.max(0.0, Math.min(30.0, Double.parseDouble(altJ)));
++
++            mStepDrive = mPrefs.getBoolean("setting_step_drive", false);
++            String stride = mPrefs.getString("setting_stride", "1.05");
++            mStride = Math.max(0.3, Math.min(2.0, Double.parseDouble(stride)));
++            String netIv = mPrefs.getString("setting_net_interval", "6");
++            mNetInterval = Math.max(1, Math.min(60, Integer.parseInt(netIv)));
++        } catch (Exception e) {
++            XLog.e("SERVICEGO: 高级仿真参数解析失败，使用默认值");
++            mAdvSim = true;
++            mJitterMeter = 0.6;
++            mSatellites = 12;
++            mAltJitter = 0.35;
++        }
++        mPrefsStamp = System.currentTimeMillis();
++    }
++
++    private void maybeReloadAdvancedSettings() {
++        if (System.currentTimeMillis() - mPrefsStamp > 2000L) {
++            reloadAdvancedSettings();
++        }
++    }
++
++    /** 高斯抖动，单位米，返回 [经度偏移, 纬度偏移] */
++    private double[] jitterOffset() {
++        if (!mAdvSim || mJitterMeter <= 0.0) {
++            return new double[] {0.0, 0.0};
++        }
++        double sigma = mJitterMeter * 0.5;
++        double dLngM = mRandom.nextGaussian() * sigma;
++        double dLatM = mRandom.nextGaussian() * sigma;
++        double dLng = dLngM / (111320.0 * Math.cos(Math.toRadians(Math.abs(mCurLat))) + 1e-9);
++        double dLat = dLatM / 110574.0;
++        return new double[] {dLng, dLat};
++    }
++
++    /** 写入 GNSS 细节 extras，尽量贴近真实 NMEA/GNSS 上报的内容 */
++    private void fillGnssExtras(Location loc) {
++        Bundle bundle = new Bundle();
++        int sat = mSatellites;
++        if (mAdvSim) {
++            sat = Math.max(4, mSatellites + mRandom.nextInt(3) - 1);
++        }
++        bundle.putInt("satellites", sat);
++        bundle.putInt("satelliteCount", sat);
++        if (mAdvSim) {
++            bundle.putDouble("averageCn0", 26.0 + mRandom.nextDouble() * 10.0);
++            bundle.putDouble("maxCn0", 38.0 + mRandom.nextDouble() * 8.0);
++            bundle.putDouble("hdop", 0.6 + mRandom.nextDouble() * 0.9);
++            bundle.putDouble("vdop", 0.8 + mRandom.nextDouble() * 1.0);
++            bundle.putInt("ttff", 1 + mRandom.nextInt(3));
++        } else {
++            bundle.putDouble("averageCn0", 30.0);
++            bundle.putDouble("maxCn0", 42.0);
++            bundle.putDouble("hdop", 0.8);
++            bundle.putDouble("vdop", 1.0);
++        }
++        bundle.putInt("ageMilis", 0);
++        loc.setExtras(bundle);
++    }
++
++    /** 逐次单调递增的时间戳，防止部分 App 判定定位被“篡改” */
++    private long monotonicTime() {
++        long now = System.currentTimeMillis();
++        if (now <= mLastGpsTs) {
++            now = mLastGpsTs + 20L;
++        }
++        mLastGpsTs = now;
++        return now;
++    }
++
+     private void removeTestProviderGPS() {
+         try {
+             if (mLocManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+@@ -235,19 +464,32 @@ public class ServiceGo extends Service {
+ 
+     private void setLocationGPS() {
+         try {
++            maybeReloadAdvancedSettings();
++
+             // 尽可能模拟真实的 GPS 数据
+             Location loc = new Location(LocationManager.GPS_PROVIDER);
+-            loc.setAccuracy(Criteria.ACCURACY_FINE);    // 设定此位置的估计水平精度，以米为单位。
+-            loc.setAltitude(mCurAlt);                     // 设置高度，在 WGS 84 参考坐标系中的米
++
++            double[] jitter = jitterOffset();
++            double lng = mCurLng + jitter[0];
++            double lat = mCurLat + jitter[1];
++
++            float accuracy = 3.0f;
++            if (mAdvSim) {
++                accuracy = (float) (2.5 + mRandom.nextDouble() * 4.0);   // 2.5 ~ 6.5 米
++            }
++
++            loc.setAccuracy(accuracy);                    // 设定此位置的估计水平精度，以米为单位。
++            loc.setAltitude(mCurAlt + (mAdvSim ? (mRandom.nextDouble() - 0.5) * 2.0 * mAltJitter : 0.0));
++            loc.setVerticalAccuracyMeters(mAdvSim ? (float) (3.0 + mRandom.nextDouble() * 5.0) : 8.0f);
+             loc.setBearing(mCurBea);                       // 方向（度）
+-            loc.setLatitude(mCurLat);                   // 纬度（度）
+-            loc.setLongitude(mCurLng);                  // 经度（度）
+-            loc.setTime(System.currentTimeMillis());    // 本地时间
+-            loc.setSpeed((float) mSpeed);
++            loc.setBearingAccuracyDegrees(mAdvSim ? (float) (1.0 + mRandom.nextDouble() * 3.0) : 5.0f);
++            loc.setLatitude(lat);                          // 纬度（度）
++            loc.setLongitude(lng);                         // 经度（度）
++            loc.setTime(monotonicTime());                  // 本地时间（单调递增）
++            loc.setSpeed((float) Math.max(0.0, mSpeed));
++            loc.setSpeedAccuracyMetersPerSecond(mAdvSim ? (float) (0.05 + mRandom.nextDouble() * 0.2) : 0.5f);
+             loc.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
+-            Bundle bundle = new Bundle();
+-            bundle.putInt("satellites", 7);
+-            loc.setExtras(bundle);
++            fillGnssExtras(loc);
+ 
+             mLocManager.setTestProviderLocation(LocationManager.GPS_PROVIDER, loc);
+         } catch (Exception e) {
+@@ -290,15 +532,36 @@ public class ServiceGo extends Service {
+ 
+     private void setLocationNetwork() {
+         try {
++            // 真实网络定位更新频率远低于 GPS，这里按间隔节流，
++            // 避免同一帧双 provider 上报同一坐标这种明显的模拟特征
++            if (mTickCounter % Math.max(1, mNetInterval) != 0) {
++                return;
++            }
++
+             // 尽可能模拟真实的 NETWORK 数据
+             Location loc = new Location(LocationManager.NETWORK_PROVIDER);
+-            loc.setAccuracy(Criteria.ACCURACY_COARSE);  // 设定此位置的估计水平精度，以米为单位。
+-            loc.setAltitude(mCurAlt);                     // 设置高度，在 WGS 84 参考坐标系中的米
+-            loc.setBearing(mCurBea);                       // 方向（度）
+-            loc.setLatitude(mCurLat);                   // 纬度（度）
+-            loc.setLongitude(mCurLng);                  // 经度（度）
+-            loc.setTime(System.currentTimeMillis());    // 本地时间
+-            loc.setSpeed((float) mSpeed);
++
++            // 网络定位本身精度差，抖动幅度比 GPS 大
++            double[] jitter = jitterOffset();
++            double netJitter = mAdvSim ? 8.0 : 0.0;
++            double dLng = jitter[0] + (mAdvSim ? (mRandom.nextGaussian() * netJitter) / (111320.0 * Math.cos(Math.toRadians(Math.abs(mCurLat))) + 1e-9) : 0.0);
++            double dLat = jitter[1] + (mAdvSim ? (mRandom.nextGaussian() * netJitter) / 110574.0 : 0.0);
++
++            float accuracy = 30.0f;
++            if (mAdvSim) {
++                accuracy = (float) (25.0 + mRandom.nextDouble() * 45.0);   // 25 ~ 70 米
++            }
++
++            loc.setAccuracy(accuracy);                  // 设定此位置的估计水平精度，以米为单位。
++            loc.setAltitude(mCurAlt);                   // 设置高度，在 WGS 84 参考坐标系中的米
++            loc.setVerticalAccuracyMeters(mAdvSim ? (float) (10.0 + mRandom.nextDouble() * 15.0) : 20.0f);
++            loc.setBearing(mCurBea);                    // 方向（度）
++            loc.setBearingAccuracyDegrees(mAdvSim ? (float) (10.0 + mRandom.nextDouble() * 20.0) : 30.0f);
++            loc.setLatitude(mCurLat + dLat);            // 纬度（度）
++            loc.setLongitude(mCurLng + dLng);           // 经度（度）
++            loc.setTime(monotonicTime());               // 本地时间（单调递增）
++            loc.setSpeed((float) Math.max(0.0, mSpeed));
++            loc.setSpeedAccuracyMetersPerSecond(mAdvSim ? (float) (0.5 + mRandom.nextDouble() * 1.5) : 2.0f);
+             loc.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
+ 
+             mLocManager.setTestProviderLocation(LocationManager.NETWORK_PROVIDER, loc);
+@@ -307,6 +570,36 @@ public class ServiceGo extends Service {
+         }
+     }
+ 
++    /*============================== 计步传感器 ==============================*/
++    private void initStepSensor() {
++        try {
++            mSensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
++            if (mSensorManager != null) {
++                mStepSensor = mSensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER);
++                if (mStepSensor != null) {
++                    mSensorManager.registerListener(this, mStepSensor, SensorManager.SENSOR_DELAY_UI);
++                    XLog.i("SERVICEGO: 计步传感器已注册");
++                }
++            }
++        } catch (Exception e) {
++            XLog.e("SERVICEGO: 计步传感器不可用 - " + e.getMessage());
++            mStepSensor = null;
++        }
++    }
++
++    @Override
++    public void onSensorChanged(SensorEvent event) {
++        if (event != null && event.sensor != null && event.sensor.getType() == Sensor.TYPE_STEP_COUNTER
++                && event.values != null && event.values.length > 0) {
++            mLastStepCountNow = event.values[0];
++        }
++    }
++
++    @Override
++    public void onAccuracyChanged(Sensor sensor, int accuracy) {
++        // 无需处理
++    }
++
+     public class NoteActionReceiver extends BroadcastReceiver {
+         @Override
+         public void onReceive(Context context, Intent intent) {
+@@ -325,14 +618,98 @@ public class ServiceGo extends Service {
+ 
+     public class ServiceGoBinder extends Binder {
+         public void setPosition(double lng, double lat, double alt) {
+-            mLocHandler.removeMessages(HANDLER_MSG_ID);
++            mRoutePlayer = null;
+             mCurLng = lng;
+             mCurLat = lat;
+             mCurAlt = alt;
+-            mLocHandler.sendEmptyMessage(HANDLER_MSG_ID);
++            mBaseAlt = alt;
+             mJoyStick.setCurrentPosition(mCurLng, mCurLat, mCurAlt);
+         }
+-    }
+-}
+ 
++        /**
++         * 开始路线巡航。
++         *
++         * @param wgsPoints     WGS84 路径点，每个元素为 {lng, lat, alt, stay}（alt/stay 可省略）
++         * @param mode          RoutePlayer.MODE_LOOP / MODE_PINGPONG / MODE_ONCE
++         * @param speed         巡航速度 m/s
++         * @param accel         加速度 m/s^2
++         * @param terrainAmp    海拔起伏幅度（米）
++         * @param terrainPeriod 海拔起伏周期（米）
++         * @return 是否成功启动
++         */
++        public boolean startRoute(List<double[]> wgsPoints, int mode, double speed,
++                                  double accel, double terrainAmp, double terrainPeriod) {
++            return startRoute(wgsPoints, mode, speed, accel, terrainAmp, terrainPeriod, 0.0, 0.0);
++        }
+ 
++        /**
++         * @param lapOffsetMeter 每圈轨迹微扰幅度（米），用于避免每圈轨迹完全重复
++         * @param driftMeter     低频漂移幅度（米）
++         */
++        public boolean startRoute(List<double[]> wgsPoints, int mode, double speed,
++                                  double accel, double terrainAmp, double terrainPeriod,
++                                  double lapOffsetMeter, double driftMeter) {
++            List<RoutePath.Point> points = new ArrayList<>();
++            if (wgsPoints != null) {
++                for (double[] p : wgsPoints) {
++                    if (p == null || p.length < 2) {
++                        continue;
++                    }
++                    double alt = p.length > 2 ? p[2] : mBaseAlt;
++                    double stay = p.length > 3 ? p[3] : 0.0;
++                    points.add(new RoutePath.Point(p[0], p[1], alt - mBaseAlt, stay));
++                }
++            }
++
++            RoutePlayer player = new RoutePlayer(points, mode, speed, accel, terrainAmp,
++                    terrainPeriod, lapOffsetMeter, driftMeter);
++            if (!player.isValid()) {
++                XLog.e("SERVICEGO: 路线点不足，无法启动巡航");
++                return false;
++            }
++
++            mRoutePlayer = player;
++            mLastTickMs = 0L;           // 重置节拍，避免用上一轮的时间差推进
++            mTickCounter = 0L;
++            mLastStepCount = -1.0f;     // 步频重新取基线
++            mJoyStick.hide();           // 巡航期间收起摇杆，避免两个控制面互相抢位置
++
++            RoutePlayer.Pose pose = player.currentPose();
++            if (pose != null) {
++                mCurLng = pose.lng;
++                mCurLat = pose.lat;
++            }
++            mJoyStick.setCurrentPosition(mCurLng, mCurLat, mCurAlt);
++            XLog.i("SERVICEGO: 路线巡航启动，点数=" + points.size() + " 长度=" + player.getLength());
++            return true;
++        }
++
++        public void pauseRoute(boolean pause) {
++            if (mRoutePlayer != null) {
++                mRoutePlayer.setPaused(pause);
++            }
++        }
++
++        public void setRouteSpeed(double speed) {
++            if (mRoutePlayer != null) {
++                mRoutePlayer.setTargetSpeed(speed);
++            }
++        }
++
++        public boolean isRouteRunning() {
++            return mRoutePlayer != null;
++        }
++
++        public double getRouteProgress() {
++            return mRoutePose == null ? 0.0 : mRoutePose.progress;
++        }
++
++        public void stopRoute() {
++            mRoutePlayer = null;
++            mLastStepCount = -1.0f;
++            mJoyStick.show();           // 巡航结束把摇杆还回来
++            // 顺带把速度归零，避免停下后仍显示运动速度
++            mSpeed = 0;
++        }
++    }
++}
+diff --git a/app/src/main/java/com/zcshou/utils/RoutePath.java b/app/src/main/java/com/zcshou/utils/RoutePath.java
+new file mode 100644
+index 0000000..56f2dab
+--- /dev/null
++++ b/app/src/main/java/com/zcshou/utils/RoutePath.java
+@@ -0,0 +1,166 @@
++package com.zcshou.utils;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Locale;
++
++/**
++ * 路线（折线）数据模型。
++ * <p>
++ * 该类型只做坐标与几何计算，不依赖 Android 框架，便于单元测试。
++ * 坐标统一使用 WGS84（模拟定位 provider 需要的坐标系）。
++ */
++public class RoutePath {
++
++    /** 单个路径点 */
++    public static class Point {
++        public double lng;
++        public double lat;
++        public double alt;
++        /** 到达该点后的停留时间（秒），0 表示不停留 */
++        public double stay;
++
++        public Point(double lng, double lat, double alt, double stay) {
++            this.lng = lng;
++            this.lat = lat;
++            this.alt = alt;
++            this.stay = stay;
++        }
++
++        public Point(double lng, double lat) {
++            this(lng, lat, 0.0, 0.0);
++        }
++
++        public Point copy() {
++            return new Point(lng, lat, alt, stay);
++        }
++
++        @Override
++        public String toString() {
++            return String.format(Locale.US, "%.7f,%.7f", lng, lat);
++        }
++    }
++
++    /** 纬度方向每度对应的米数 */
++    public static final double METER_PER_DEG_LAT = 110574.0;
++
++    /** 计算经度方向每度对应的米数（随纬度变化） */
++    public static double meterPerDegLng(double lat) {
++        double c = Math.cos(Math.toRadians(lat));
++        if (Math.abs(c) < 1e-9) {
++            c = 1e-9;
++        }
++        return 111320.0 * c;
++    }
++
++    /** 两点的近似平面距离（米），几十公里内误差可忽略 */
++    public static double distanceMeter(Point a, Point b) {
++        if (a == null || b == null) {
++            return 0.0;
++        }
++        double midLat = (a.lat + b.lat) / 2.0;
++        double dy = (b.lat - a.lat) * METER_PER_DEG_LAT;
++        double dx = (b.lng - a.lng) * meterPerDegLng(midLat);
++        return Math.sqrt(dx * dx + dy * dy);
++    }
++
++    /** 起点到终点的方位角（0~360，正北为 0，顺时针） */
++    public static double bearingDeg(Point a, Point b) {
++        if (a == null || b == null) {
++            return 0.0;
++        }
++        double dy = (b.lat - a.lat) * METER_PER_DEG_LAT;
++        double dx = (b.lng - a.lng) * meterPerDegLng((a.lat + b.lat) / 2.0);
++        if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) {
++            return 0.0;
++        }
++        double deg = Math.toDegrees(Math.atan2(dx, dy));
++        deg %= 360.0;
++        if (deg < 0) {
++            deg += 360.0;
++        }
++        return deg;
++    }
++
++    /** 按米数在两点之间做线性插值 */
++    public static Point interpolate(Point a, Point b, double ratio) {
++        if (a == null && b == null) {
++            return new Point(0, 0);
++        }
++        if (a == null) {
++            return b.copy();
++        }
++        if (b == null) {
++            return a.copy();
++        }
++        double r = Math.max(0.0, Math.min(1.0, ratio));
++        return new Point(a.lng + (b.lng - a.lng) * r,
++                a.lat + (b.lat - a.lat) * r,
++                a.alt + (b.alt - a.alt) * r,
++                b.stay);
++    }
++
++    /**
++     * 把路径序列化为可在 SharedPreferences 中保存的字符串。
++     * 格式：lng,lat,alt,stay;lng,lat,alt,stay
++     */
++    public static String encode(List<Point> points) {
++        if (points == null || points.isEmpty()) {
++            return "";
++        }
++        StringBuilder sb = new StringBuilder();
++        for (Point p : points) {
++            if (p == null) {
++                continue;
++            }
++            if (sb.length() > 0) {
++                sb.append(';');
++            }
++            sb.append(String.format(Locale.US, "%.7f,%.7f,%.2f,%.2f", p.lng, p.lat, p.alt, p.stay));
++        }
++        return sb.toString();
++    }
++
++    /** 反序列化，格式错误时返回空列表，绝不抛异常 */
++    public static List<Point> decode(String text) {
++        List<Point> points = new ArrayList<>();
++        if (text == null || text.trim().isEmpty()) {
++            return points;
++        }
++        String[] items = text.split(";");
++        for (String item : items) {
++            if (item == null || item.trim().isEmpty()) {
++                continue;
++            }
++            String[] f = item.split(",");
++            if (f.length < 2) {
++                continue;
++            }
++            try {
++                double lng = Double.parseDouble(f[0]);
++                double lat = Double.parseDouble(f[1]);
++                double alt = f.length > 2 ? Double.parseDouble(f[2]) : 0.0;
++                double stay = f.length > 3 ? Double.parseDouble(f[3]) : 0.0;
++                if (Double.isNaN(lng) || Double.isNaN(lat)) {
++                    continue;
++                }
++                points.add(new Point(lng, lat, alt, stay));
++            } catch (NumberFormatException ignored) {
++                // 跳过坏点
++            }
++        }
++        return points;
++    }
++
++    /** 路径总长度（米） */
++    public static double totalLength(List<Point> points) {
++        if (points == null || points.size() < 2) {
++            return 0.0;
++        }
++        double sum = 0.0;
++        for (int i = 1; i < points.size(); i++) {
++            sum += distanceMeter(points.get(i - 1), points.get(i));
++        }
++        return sum;
++    }
++}
+diff --git a/app/src/main/java/com/zcshou/utils/RoutePlayer.java b/app/src/main/java/com/zcshou/utils/RoutePlayer.java
+new file mode 100644
+index 0000000..97e4013
+--- /dev/null
++++ b/app/src/main/java/com/zcshou/utils/RoutePlayer.java
+@@ -0,0 +1,451 @@
++package com.zcshou.utils;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Random;
++
++/**
++ * 路线巡航播放器（“循环路径”核心）v2。
++ * <p>
++ * v2 相比 v1 的改进：
++ * 1. 修复循环接缝：到点结算后不再重复结算（justWrapped 守卫），停留计时在换圈时清零；
++ * 2. 每圈轨迹微扰：lapOffsetMeter 生效时，每圈整体沿正弦包络偏移，接缝处偏移为 0，
++ *    既让每圈轨迹不完全相同（避免被判“重复轨迹”），又不会产生位置跳变；
++ * 3. 低频漂移：driftMeter 用慢速正弦而非白噪声，位置连续、方差小，
++ *    不会触发跑步类 App 的“漂移点 / 方差”过滤器；
++ * 4. 转弯降速：距离拐点 10 m 内按转角比例线性降速，最多降 45%；
++ * 5. 步频驱动：advanceMeters(m) 让服务端用真实步数×步幅推进，步数与距离自洽；
++ * 6. 位置严格单调前进，不会来回抖动。
++ */
++public class RoutePlayer {
++
++    /** 闭环循环：走到终点后沿闭合段回到起点，反复进行 */
++    public static final int MODE_LOOP = 0;
++    /** 往返：走到终点后原路返回，反复进行 */
++    public static final int MODE_PINGPONG = 1;
++    /** 单次：走到终点即结束 */
++    public static final int MODE_ONCE = 2;
++
++    /** 一次推进返回的姿态 */
++    public static class Pose {
++        public double lng;
++        public double lat;
++        /** 相对海拔偏移（米），由地形项产生，调用方自行叠加基准海拔 */
++        public double alt;
++        public double speed;
++        public double bearing;
++        /** 本圈进度 0~1 */
++        public double progress;
++        public int lap;
++        public boolean moving;
++        public boolean finished;
++    }
++
++    private final List<RoutePath.Point> path = new ArrayList<>();
++    private double[] segLen = new double[0];
++    private double lapLen = 0.0;
++
++    private final int mode;
++    private final double accel;
++    private final double terrainAmp;
++    private final double terrainPeriod;
++    private final double lapOffsetMeter;
++    private final double driftMeter;
++
++    private final Random rnd = new Random();
++
++    private double targetSpeed;
++    private double curSpeed = 0.0;
++
++    private int seg = 0;
++    private double distInSeg = 0.0;
++    private double travelled = 0.0;
++    private double lapTravelled = 0.0;
++    private int lap = 0;
++    private double dwellLeft = 0.0;
++    private boolean paused = false;
++    private boolean finished = false;
++    private boolean justWrapped = false;
++    private double lastBearing = 0.0;
++    private double elapsed = 0.0;
++
++    /* 本圈微扰向量与漂移相位 */
++    private double lapOffLng = 0.0;
++    private double lapOffLat = 0.0;
++    private final double driftPhaseX = 0.0;
++    private final double driftPhaseY = 1.7;
++
++    public RoutePlayer(List<RoutePath.Point> points, int mode, double speed,
++                       double accel, double terrainAmp, double terrainPeriod) {
++        this(points, mode, speed, accel, terrainAmp, terrainPeriod, 0.0, 0.0);
++    }
++
++    /**
++     * @param lapOffsetMeter 每圈轨迹微扰幅度（米），0 表示每圈完全一致
++     * @param driftMeter     低频漂移幅度（米），0 表示不加漂移
++     */
++    public RoutePlayer(List<RoutePath.Point> points, int mode, double speed,
++                       double accel, double terrainAmp, double terrainPeriod,
++                       double lapOffsetMeter, double driftMeter) {
++        this.mode = mode;
++        this.targetSpeed = speed > 0 ? speed : 1.2;
++        this.accel = accel > 0 ? accel : 1.2;
++        this.terrainAmp = Math.max(0.0, terrainAmp);
++        this.terrainPeriod = terrainPeriod > 1.0 ? terrainPeriod : 500.0;
++        this.lapOffsetMeter = Math.max(0.0, lapOffsetMeter);
++        this.driftMeter = Math.max(0.0, driftMeter);
++
++        List<RoutePath.Point> valid = new ArrayList<>();
++        if (points != null) {
++            for (RoutePath.Point p : points) {
++                if (p == null) {
++                    continue;
++                }
++                if (!valid.isEmpty()
++                        && RoutePath.distanceMeter(valid.get(valid.size() - 1), p) < 0.05) {
++                    continue;
++                }
++                valid.add(p.copy());
++            }
++        }
++        path.addAll(valid);
++        if (mode == MODE_LOOP && path.size() >= 2) {
++            RoutePath.Point first = path.get(0);
++            RoutePath.Point last = path.get(path.size() - 1);
++            if (RoutePath.distanceMeter(first, last) > 0.5) {
++                path.add(first.copy());
++            }
++        }
++        rebuild();
++        newLapOffset();
++    }
++
++    private void rebuild() {
++        segLen = new double[Math.max(0, path.size() - 1)];
++        lapLen = 0.0;
++        for (int i = 1; i < path.size(); i++) {
++            double d = RoutePath.distanceMeter(path.get(i - 1), path.get(i));
++            segLen[i - 1] = d;
++            lapLen += d;
++        }
++        if (seg >= segLen.length) {
++            seg = Math.max(0, segLen.length - 1);
++            distInSeg = 0;
++        }
++    }
++
++    /** 每圈重新抽一个偏移向量（正弦包络，接缝处为 0） */
++    private void newLapOffset() {
++        if (lapOffsetMeter <= 0) {
++            lapOffLng = 0;
++            lapOffLat = 0;
++            return;
++        }
++        double ang = rnd.nextDouble() * 2 * Math.PI;
++        double mag = lapOffsetMeter * (0.4 + 0.6 * rnd.nextDouble());
++        double midLat = path.isEmpty() ? 30.0 : path.get(0).lat;
++        lapOffLat = (mag * Math.cos(ang)) / RoutePath.METER_PER_DEG_LAT;
++        lapOffLng = (mag * Math.sin(ang)) / RoutePath.meterPerDegLng(midLat);
++    }
++
++    public boolean isValid() {
++        return path.size() >= 2 && lapLen > 0.01;
++    }
++
++    public double getLength() {
++        return lapLen;
++    }
++
++    public double getTravelled() {
++        return travelled;
++    }
++
++    public int getLap() {
++        return lap;
++    }
++
++    public int getMode() {
++        return mode;
++    }
++
++    public boolean isFinished() {
++        return finished;
++    }
++
++    public boolean isPaused() {
++        return paused;
++    }
++
++    public double getTargetSpeed() {
++        return targetSpeed;
++    }
++
++    public void setTargetSpeed(double speed) {
++        if (speed >= 0) {
++            targetSpeed = speed;
++        }
++    }
++
++    public void setPaused(boolean p) {
++        paused = p;
++    }
++
++    public void reset() {
++        seg = 0;
++        distInSeg = 0;
++        travelled = 0;
++        lapTravelled = 0;
++        lap = 0;
++        dwellLeft = 0;
++        curSpeed = 0;
++        finished = false;
++        justWrapped = false;
++        lastBearing = 0;
++        elapsed = 0;
++        if (mode == MODE_PINGPONG && path.size() >= 2) {
++            RoutePath.Point first = path.get(0);
++            RoutePath.Point last = path.get(path.size() - 1);
++            if (RoutePath.distanceMeter(first, last) < 0.5 && path.size() > 2) {
++                Collections.reverse(path);
++            }
++        }
++        newLapOffset();
++        rebuild();
++    }
++
++    /** 当前姿态（不推进时间） */
++    public Pose currentPose() {
++        Pose pose = new Pose();
++        pose.lap = lap;
++        pose.speed = curSpeed;
++        pose.bearing = lastBearing;
++        pose.progress = lapLen > 0 ? Math.min(1.0, lapTravelled / lapLen) : 0.0;
++        pose.finished = finished;
++
++        if (path.isEmpty()) {
++            return pose;
++        }
++        if (path.size() == 1 || seg >= path.size() - 1) {
++            RoutePath.Point p = path.get(path.size() - 1);
++            pose.lng = p.lng;
++            pose.lat = p.lat;
++            pose.alt = altitudeOffset();
++            applyOffset(pose);
++            return pose;
++        }
++        RoutePath.Point a = path.get(seg);
++        RoutePath.Point b = path.get(seg + 1);
++        double f = segLen[seg] <= 1e-9 ? 0.0 : distInSeg / segLen[seg];
++        RoutePath.Point p = RoutePath.interpolate(a, b, f);
++        pose.lng = p.lng;
++        pose.lat = p.lat;
++        pose.alt = altitudeOffset();
++        applyOffset(pose);
++        return pose;
++    }
++
++    /** 叠加每圈微扰（正弦包络）与低频漂移，保证接缝连续、不来回跳 */
++    private void applyOffset(Pose pose) {
++        double p = lapLen > 0 ? Math.min(1.0, lapTravelled / lapLen) : 0.0;
++
++        if (lapOffsetMeter > 0) {
++            double envelope = Math.sin(Math.PI * p);     // 0 → 1 → 0，接缝为 0
++            pose.lng += lapOffLng * envelope;
++            pose.lat += lapOffLat * envelope;
++        }
++
++        if (driftMeter > 0) {
++            double dx = driftMeter * Math.sin(2 * Math.PI * elapsed / 47.0 + driftPhaseX);
++            double dy = driftMeter * Math.cos(2 * Math.PI * elapsed / 61.0 + driftPhaseY);
++            pose.lng += dx / Math.max(1.0, RoutePath.meterPerDegLng(pose.lat));
++            pose.lat += dy / RoutePath.METER_PER_DEG_LAT;
++        }
++    }
++
++    private double altitudeOffset() {
++        if (terrainAmp <= 0) {
++            return 0.0;
++        }
++        double phase = 2.0 * Math.PI * (lapTravelled / terrainPeriod);
++        return terrainAmp * Math.sin(phase);
++    }
++
++    /** 转弯降速：距拐点 10 m 内按转角比例降速，最多 45% */
++    private double cornerLimitedSpeed() {
++        double target = targetSpeed;
++        if (path.size() < 3 || segLen.length < 2) {
++            return target;
++        }
++        int next = seg + 1;
++        if (next >= segLen.length) {
++            return target;
++        }
++        double remain = Math.max(0.0, segLen[seg] - distInSeg);
++        if (remain > 10.0) {
++            return target;
++        }
++        double b1 = RoutePath.bearingDeg(path.get(seg), path.get(seg + 1));
++        double b2 = RoutePath.bearingDeg(path.get(next), path.get(next + 1));
++        double diff = Math.abs(((b2 - b1 + 540.0) % 360.0) - 180.0);   // 0~180
++        if (diff < 15.0) {
++            return target;
++        }
++        double ratio = Math.min(1.0, diff / 90.0);
++        double fade = 1.0 - remain / 10.0;                               // 0 → 1
++        return target * (1.0 - 0.45 * ratio * fade);
++    }
++
++    /**
++     * 推进 dt 秒，返回新的姿态。
++     */
++    public Pose tick(double dt) {
++        if (dt <= 0) {
++            dt = 0.001;
++        }
++        if (dt > 1.0) {
++            dt = 1.0;
++        }
++        elapsed += dt;
++        justWrapped = false;
++
++        if (!isValid() || finished) {
++            Pose p = currentPose();
++            p.finished = true;
++            p.speed = 0;
++            return p;
++        }
++
++        double wanted = paused ? 0.0 : cornerLimitedSpeed();
++        if (curSpeed < wanted) {
++            curSpeed = Math.min(wanted, curSpeed + accel * dt);
++        } else if (curSpeed > wanted) {
++            curSpeed = Math.max(wanted, curSpeed - accel * 2.0 * dt);
++        }
++
++        if (dwellLeft > 0) {
++            dwellLeft -= dt;
++            curSpeed = 0.0;
++            Pose p = currentPose();
++            p.moving = false;
++            p.speed = 0;
++            return p;
++        }
++
++        double move = curSpeed * dt;
++        if (move > 0) {
++            advanceBy(move);
++        }
++
++        Pose pose = currentPose();
++        pose.speed = curSpeed;
++        pose.moving = curSpeed > 0.05 && !finished;
++        pose.finished = finished;
++        pose.bearing = lastBearing;
++
++        if (path.size() >= 2) {
++            RoutePath.Point a = path.get(Math.min(seg, path.size() - 2));
++            RoutePath.Point b = path.get(Math.min(seg + 1, path.size() - 1));
++            double bea = RoutePath.bearingDeg(a, b);
++            if (curSpeed > 0.1) {
++                double diff = ((bea - lastBearing + 540.0) % 360.0) - 180.0;
++                lastBearing = (lastBearing + diff * Math.min(1.0, dt * 6.0) + 360.0) % 360.0;
++            }
++            pose.bearing = lastBearing;
++        }
++
++        return pose;
++    }
++
++    /**
++     * 按米数推进（步频驱动时由服务端调用），返回推进后的姿态。
++     */
++    public Pose advanceMeters(double meters) {
++        elapsed += 0.1;
++        justWrapped = false;
++        if (!isValid() || finished || meters <= 0) {
++            return currentPose();
++        }
++        advanceBy(meters);
++        Pose pose = currentPose();
++        pose.bearing = lastBearing;
++        pose.speed = curSpeed > 0 ? curSpeed : targetSpeed;
++        pose.moving = true;
++        pose.finished = finished;
++        return pose;
++    }
++
++    private void advanceBy(double meters) {
++        double left = meters;
++        int guard = 0;
++
++        while (left > 1e-9 && !finished && guard++ < 100000) {
++            if (seg >= segLen.length) {
++                onReachEnd();
++                if (finished) {
++                    break;
++                }
++                continue;
++            }
++
++            double remain = segLen[seg] - distInSeg;
++            if (remain > 1e-9 && left < remain) {
++                distInSeg += left;
++                lapTravelled += left;
++                travelled += left;
++                return;
++            }
++
++            double step = Math.max(remain, 0.0);
++            left -= step;
++            lapTravelled += step;
++            travelled += step;
++
++            RoutePath.Point waypoint = path.get(Math.min(seg + 1, path.size() - 1));
++            seg++;
++            distInSeg = 0.0;
++
++            if (waypoint.stay > 0) {
++                dwellLeft = waypoint.stay;
++                return;
++            }
++
++            if (seg >= path.size() - 1) {
++                onReachEnd();
++            }
++        }
++
++        // 浮点兜底：刚好走完最后一段（且本帧尚未换圈）时立刻结算，避免多等一帧
++        if (!finished && !justWrapped && segLen.length > 0
++                && seg == segLen.length - 1 && segLen[seg] - distInSeg <= 1e-6) {
++            onReachEnd();
++        }
++    }
++
++    private void onReachEnd() {
++        lap++;
++        lapTravelled = 0.0;
++        dwellLeft = 0.0;
++
++        switch (mode) {
++            case MODE_ONCE:
++                finished = true;
++                curSpeed = 0.0;
++                break;
++            case MODE_LOOP:
++                seg = 0;
++                distInSeg = 0.0;
++                newLapOffset();
++                break;
++            case MODE_PINGPONG:
++            default:
++                Collections.reverse(path);
++                seg = 0;
++                distInSeg = 0.0;
++                rebuild();
++                newLapOffset();
++                break;
++        }
++        justWrapped = true;
++    }
++}
+diff --git a/app/src/main/res/layout/main_content.xml b/app/src/main/res/layout/main_content.xml
+index c2ea2a1..2963f80 100644
+--- a/app/src/main/res/layout/main_content.xml
++++ b/app/src/main/res/layout/main_content.xml
+@@ -1,76 +1,189 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<androidx.coordinatorlayout.widget.CoordinatorLayout xmlns:android="http://schemas.android.com/apk/res/android"
+-    xmlns:app="http://schemas.android.com/apk/res-auto"
+-    xmlns:tools="http://schemas.android.com/tools"
+-    android:layout_width="match_parent"
+-    android:layout_height="match_parent"
+-    tools:context=".MainActivity">
+-
+-    <FrameLayout
+-        android:layout_width="match_parent"
+-        android:layout_height="match_parent">
+-
+-        <com.google.android.material.appbar.AppBarLayout
+-            android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:theme="@style/AppTheme.AppBarOverlay">
+-
+-            <androidx.appcompat.widget.Toolbar
+-                android:id="@+id/toolbar"
+-                android:layout_width="match_parent"
+-                android:layout_height="?attr/actionBarSize"
+-                android:background="@color/colorPrimary"
+-                app:popupTheme="@style/AppTheme.PopupOverlay" />
+-
+-        </com.google.android.material.appbar.AppBarLayout>
+-
+-        <include
+-            layout="@layout/main_map"
+-            android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:layout_marginTop="?attr/actionBarSize" />
+-
+-        <com.google.android.material.floatingactionbutton.FloatingActionButton
+-            android:id="@+id/faBtnStart"
+-            android:layout_width="wrap_content"
+-            android:layout_height="wrap_content"
+-            android:layout_gravity="bottom|start"
+-            android:layout_marginStart="30dp"
+-            android:layout_marginBottom="80dp"
+-            android:contentDescription="@null"
+-            app:elevation="6dp"
+-            app:pressedTranslationZ="12dp"
+-            app:srcCompat="@drawable/ic_position" />
+-
+-        <LinearLayout
+-            android:id="@+id/search_linear"
+-            android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:background="#ddffffff"
+-            android:visibility="gone"
+-            android:layout_marginTop="?attr/actionBarSize">
+-            <ListView
+-                android:id="@+id/search_list_view"
+-                android:layout_width="match_parent"
+-                android:layout_margin="10dp"
+-                android:layout_height="wrap_content">
+-            </ListView>
+-        </LinearLayout>
+-
+-        <LinearLayout
+-            android:id="@+id/search_history_linear"
+-            android:layout_width="match_parent"
+-            android:layout_height="wrap_content"
+-            android:background="#ddffffff"
+-            android:visibility="gone"
+-            android:layout_marginTop="?attr/actionBarSize">
+-            <ListView
+-                android:id="@+id/search_history_list_view"
+-                android:layout_width="match_parent"
+-                android:layout_margin="10dp"
+-                android:layout_height="wrap_content">
+-            </ListView>
+-        </LinearLayout>
+-
+-    </FrameLayout>
++<?xml version="1.0" encoding="utf-8"?>
++<androidx.coordinatorlayout.widget.CoordinatorLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    tools:context=".MainActivity">
++
++    <FrameLayout
++        android:layout_width="match_parent"
++        android:layout_height="match_parent">
++
++        <com.google.android.material.appbar.AppBarLayout
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:theme="@style/AppTheme.AppBarOverlay">
++
++            <androidx.appcompat.widget.Toolbar
++                android:id="@+id/toolbar"
++                android:layout_width="match_parent"
++                android:layout_height="?attr/actionBarSize"
++                android:background="@color/colorPrimary"
++                app:popupTheme="@style/AppTheme.PopupOverlay" />
++
++        </com.google.android.material.appbar.AppBarLayout>
++
++        <include
++            layout="@layout/main_map"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="?attr/actionBarSize" />
++
++        <com.google.android.material.floatingactionbutton.FloatingActionButton
++            android:id="@+id/faBtnStart"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_gravity="bottom|start"
++            android:layout_marginStart="30dp"
++            android:layout_marginBottom="80dp"
++            android:contentDescription="@null"
++            app:elevation="6dp"
++            app:pressedTranslationZ="12dp"
++            app:srcCompat="@drawable/ic_position" />
++
++        <LinearLayout
++            android:id="@+id/search_linear"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:background="#ddffffff"
++            android:visibility="gone"
++            android:layout_marginTop="?attr/actionBarSize">
++            <ListView
++                android:id="@+id/search_list_view"
++                android:layout_width="match_parent"
++                android:layout_margin="10dp"
++                android:layout_height="wrap_content">
++            </ListView>
++        </LinearLayout>
++
++        <LinearLayout
++            android:id="@+id/search_history_linear"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:background="#ddffffff"
++            android:visibility="gone"
++            android:layout_marginTop="?attr/actionBarSize">
++            <ListView
++                android:id="@+id/search_history_list_view"
++                android:layout_width="match_parent"
++                android:layout_margin="10dp"
++                android:layout_height="wrap_content">
++            </ListView>
++        </LinearLayout>
++
++        <LinearLayout
++            android:id="@+id/route_panel"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_gravity="bottom"
++            android:background="#e8ffffff"
++            android:orientation="vertical"
++            android:padding="8dp"
++            android:visibility="gone">
++
++            <TextView
++                android:id="@+id/route_status"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:text="@string/route_status_empty"
++                android:textColor="#222222"
++                android:textSize="13sp" />
++
++            <LinearLayout
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:orientation="horizontal">
++
++                <Button
++                    android:id="@+id/route_btn_edit"
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_weight="1"
++                    android:text="@string/route_btn_edit_on"
++                    android:textSize="12sp" />
++
++                <Button
++                    android:id="@+id/route_btn_undo"
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_weight="1"
++                    android:text="@string/route_btn_undo"
++                    android:textSize="12sp" />
++
++                <Button
++                    android:id="@+id/route_btn_clear"
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_weight="1"
++                    android:text="@string/route_btn_clear"
++                    android:textSize="12sp" />
++            </LinearLayout>
++
++            <LinearLayout
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:gravity="center_vertical"
++                android:orientation="horizontal">
++
++                <CheckBox
++                    android:id="@+id/route_chk_loop"
++                    android:layout_width="wrap_content"
++                    android:layout_height="wrap_content"
++                    android:checked="true"
++                    android:text="@string/route_chk_loop"
++                    android:textSize="12sp" />
++
++                <CheckBox
++                    android:id="@+id/route_chk_pingpong"
++                    android:layout_width="wrap_content"
++                    android:layout_height="wrap_content"
++                    android:text="@string/route_chk_pingpong"
++                    android:textSize="12sp" />
++
++                <EditText
++                    android:id="@+id/route_speed"
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_weight="1"
++                    android:ems="4"
++                    android:hint="@string/route_speed_hint"
++                    android:importantForAutofill="no"
++                    android:inputType="numberDecimal"
++                    android:text="5.0"
++                    android:textSize="12sp" />
++            </LinearLayout>
++
++            <LinearLayout
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:orientation="horizontal">
++
++                <Button
++                    android:id="@+id/route_btn_start"
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_weight="1"
++                    android:text="@string/route_btn_start"
++                    android:textSize="12sp" />
++
++                <Button
++                    android:id="@+id/route_btn_pause"
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_weight="1"
++                    android:text="@string/route_btn_pause"
++                    android:textSize="12sp" />
++
++                <Button
++                    android:id="@+id/route_btn_stop"
++                    android:layout_width="0dp"
++                    android:layout_height="wrap_content"
++                    android:layout_weight="1"
++                    android:text="@string/route_btn_stop"
++                    android:textSize="12sp" />
++            </LinearLayout>
++        </LinearLayout>
++
++    </FrameLayout>
+ </androidx.coordinatorlayout.widget.CoordinatorLayout>
+\ No newline at end of file
+diff --git a/app/src/main/res/menu/menu_main.xml b/app/src/main/res/menu/menu_main.xml
+index 4f23e2d..adcf1f9 100644
+--- a/app/src/main/res/menu/menu_main.xml
++++ b/app/src/main/res/menu/menu_main.xml
+@@ -8,4 +8,8 @@
+         android:title=""
+         app:actionViewClass="androidx.appcompat.widget.SearchView"
+         app:showAsAction="always|collapseActionView" />
++    <item
++        android:id="@+id/action_route"
++        android:title="@string/route_menu"
++        app:showAsAction="never" />
+ </menu>
+diff --git a/app/src/main/res/values/arrays.xml b/app/src/main/res/values/arrays.xml
+index 5773207..c7e82f0 100644
+--- a/app/src/main/res/values/arrays.xml
++++ b/app/src/main/res/values/arrays.xml
+@@ -18,4 +18,14 @@
+         <item>2</item>
+     </string-array>
+ 
++    <string-array name="array_route_mode">
++        <item>循环（走完接回起点）</item>
++        <item>往返（原路返回）</item>
++        <item>单次</item>
++    </string-array>
++    <string-array name="array_route_mode_values">
++        <item>0</item>
++        <item>1</item>
++        <item>2</item>
++    </string-array>
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 9aad9af..72b2b87 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -137,4 +137,69 @@
+     <string name="update_ignore">忽略一次</string>
+     <string name="update_time">更新时间：</string>
+     <string name="update_commit">提交信息：</string>
++
++    <!-- 路线巡航（循环路径） -->
++    <string name="route_menu">路线巡航</string>
++    <string name="route_panel_title">路线巡航</string>
++    <string name="route_btn_edit_on">开始加点</string>
++    <string name="route_btn_edit_off">停止加点</string>
++    <string name="route_btn_undo">撤销</string>
++    <string name="route_btn_clear">清空</string>
++    <string name="route_btn_start">开始</string>
++    <string name="route_btn_pause">暂停</string>
++    <string name="route_btn_resume">继续</string>
++    <string name="route_btn_stop">停止</string>
++    <string name="route_chk_loop">循环</string>
++    <string name="route_chk_pingpong">往返</string>
++    <string name="route_speed_hint">速度</string>
++    <string name="route_tips_add_point">加点模式：点击地图添加路径点</string>
++    <string name="route_status_empty">路线：0 个点</string>
++    <string name="route_status_fmt">路线：%1$d 个点 · %2$.0f 米</string>
++    <string name="route_started">路线巡航已开始</string>
++    <string name="route_stopped">路线巡航已停止</string>
++    <string name="route_need_points">请至少添加 2 个有效路径点</string>
++    <string name="route_finished">路线巡航完成</string>
++    <string name="route_running_fmt">巡航 %1$.1f m/s · 进度 %2$.0f%% · 第 %3$d 圈</string>
++    <string name="route_paused">路线巡航已暂停</string>
++    <string name="route_invalid_speed">速度不合法，已使用默认值</string>
++
++    <!-- 定位高级仿真 -->
++    <string name="setting_group_adv_loc">定位高级仿真</string>
++    <string name="setting_adv_sim">高级仿真</string>
++    <string name="setting_adv_sim_summary">模拟精度/卫星数/多普勒/海拔起伏等细节，降低被识别概率</string>
++    <string name="setting_jitter">位置抖动幅度(米)</string>
++    <string name="setting_jitter_default">0.6</string>
++    <string name="setting_satellites">模拟卫星数</string>
++    <string name="setting_satellites_default">12</string>
++    <string name="setting_alt_jitter">海拔抖动(米)</string>
++    <string name="setting_alt_jitter_default">0.35</string>
++
++    <!-- 路线默认参数 -->
++    <string name="setting_group_route">路线巡航</string>
++    <string name="setting_route_speed">默认巡航速度(米/秒)</string>
++    <string name="setting_route_speed_default">5.0</string>
++    <string name="setting_route_accel">起步加速度(米/秒²)</string>
++    <string name="setting_route_accel_default">1.2</string>
++    <string name="setting_route_terrain">海拔起伏幅度(米)</string>
++    <string name="setting_route_terrain_default">1.5</string>
++    <string name="setting_route_mode">默认路线模式</string>
++
++    <!-- 跑步模式 / 循环优化 -->
++    <string name="setting_group_running">跑步与循环优化</string>
++    <string name="setting_step_drive">步频联动（真实计步驱动）</string>
++    <string name="setting_step_drive_summary">用手机真实步数×步幅推进位置，步数与距离自洽；需 ACTIVITY_RECOGNITION 权限</string>
++    <string name="setting_stride">步幅(米/步)</string>
++    <string name="setting_stride_default">1.05</string>
++    <string name="setting_loop_offset">每圈轨迹微扰(米)</string>
++    <string name="setting_loop_offset_summary">每圈整体偏移一点点，避免每圈轨迹完全重合被判定重复；0 关闭</string>
++    <string name="setting_loop_offset_default">1.2</string>
++    <string name="setting_drift">低频漂移(米)</string>
++    <string name="setting_drift_summary">慢速正弦漂移，位置连续不来回跳；0 关闭（最保守）</string>
++    <string name="setting_drift_default">0.25</string>
++    <string name="setting_net_interval">网络定位上报间隔(帧)</string>
++    <string name="setting_net_interval_summary">10 帧/秒，默认每 6 帧上报一次网络定位，贴近真实更新频率</string>
++    <string name="setting_net_interval_default">6</string>
++    <string name="route_point_too_close">两点太近（小于 3 米），已忽略重叠点</string>
++    <string name="route_insert_current">已把当前位置插入为起点，避免启动时瞬移</string>
++    <string name="route_edit_blocked">正在加点，请先「停止加点」再传送</string>
+ </resources>
+diff --git a/app/src/main/res/xml/preferences_main.xml b/app/src/main/res/xml/preferences_main.xml
+index 9d62941..54857e0 100644
+--- a/app/src/main/res/xml/preferences_main.xml
++++ b/app/src/main/res/xml/preferences_main.xml
+@@ -86,6 +86,113 @@
+             app:iconSpaceReserved="false"/>
+     </PreferenceCategory>
+ 
++    <PreferenceCategory
++        app:title="@string/setting_group_adv_loc"
++        app:iconSpaceReserved="false">
++
++        <SwitchPreferenceCompat
++            app:key="setting_adv_sim"
++            app:title="@string/setting_adv_sim"
++            app:summary="@string/setting_adv_sim_summary"
++            app:defaultValue="true"
++            app:iconSpaceReserved="false"/>
++
++        <EditTextPreference
++            app:key="setting_jitter"
++            app:title="@string/setting_jitter"
++            app:defaultValue="@string/setting_jitter_default"
++            app:summary="@string/setting_jitter_default"
++            app:iconSpaceReserved="false"/>
++
++        <EditTextPreference
++            app:key="setting_satellites"
++            app:title="@string/setting_satellites"
++            app:defaultValue="@string/setting_satellites_default"
++            app:summary="@string/setting_satellites_default"
++            app:iconSpaceReserved="false"/>
++
++        <EditTextPreference
++            app:key="setting_alt_jitter"
++            app:title="@string/setting_alt_jitter"
++            app:defaultValue="@string/setting_alt_jitter_default"
++            app:summary="@string/setting_alt_jitter_default"
++            app:iconSpaceReserved="false"/>
++    </PreferenceCategory>
++
++    <PreferenceCategory
++        app:title="@string/setting_group_route"
++        app:iconSpaceReserved="false">
++
++        <EditTextPreference
++            app:key="setting_route_speed"
++            app:title="@string/setting_route_speed"
++            app:defaultValue="@string/setting_route_speed_default"
++            app:summary="@string/setting_route_speed_default"
++            app:iconSpaceReserved="false"/>
++
++        <EditTextPreference
++            app:key="setting_route_accel"
++            app:title="@string/setting_route_accel"
++            app:defaultValue="@string/setting_route_accel_default"
++            app:summary="@string/setting_route_accel_default"
++            app:iconSpaceReserved="false"/>
++
++        <EditTextPreference
++            app:key="setting_route_terrain"
++            app:title="@string/setting_route_terrain"
++            app:defaultValue="@string/setting_route_terrain_default"
++            app:summary="@string/setting_route_terrain_default"
++            app:iconSpaceReserved="false"/>
++
++        <ListPreference
++            app:key="setting_route_mode"
++            app:title="@string/setting_route_mode"
++            app:entries="@array/array_route_mode"
++            app:entryValues="@array/array_route_mode_values"
++            app:defaultValue="0"
++            app:iconSpaceReserved="false"/>
++    </PreferenceCategory>
++
++    <PreferenceCategory
++        app:title="@string/setting_group_running"
++        app:iconSpaceReserved="false">
++
++        <SwitchPreferenceCompat
++            app:key="setting_step_drive"
++            app:title="@string/setting_step_drive"
++            app:summary="@string/setting_step_drive_summary"
++            app:defaultValue="false"
++            app:iconSpaceReserved="false"/>
++
++        <EditTextPreference
++            app:key="setting_stride"
++            app:title="@string/setting_stride"
++            app:defaultValue="@string/setting_stride_default"
++            app:summary="@string/setting_stride_default"
++            app:iconSpaceReserved="false"/>
++
++        <EditTextPreference
++            app:key="setting_loop_offset"
++            app:title="@string/setting_loop_offset"
++            app:summary="@string/setting_loop_offset_summary"
++            app:defaultValue="@string/setting_loop_offset_default"
++            app:iconSpaceReserved="false"/>
++
++        <EditTextPreference
++            app:key="setting_drift"
++            app:title="@string/setting_drift"
++            app:summary="@string/setting_drift_summary"
++            app:defaultValue="@string/setting_drift_default"
++            app:iconSpaceReserved="false"/>
++
++        <EditTextPreference
++            app:key="setting_net_interval"
++            app:title="@string/setting_net_interval"
++            app:summary="@string/setting_net_interval_summary"
++            app:defaultValue="@string/setting_net_interval_default"
++            app:iconSpaceReserved="false"/>
++    </PreferenceCategory>
++
+     <PreferenceCategory
+         app:title="@string/setting_group_about"
+         app:iconSpaceReserved="false">
+diff --git a/build.gradle b/build.gradle
+index 729f5da..ede2213 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -7,9 +7,8 @@ buildscript {
+     }
+ 
+     dependencies {
+-        classpath 'com.android.tools.build:gradle:8.12.1'
++        classpath 'com.android.tools.build:gradle:7.4.2'
+         // 谷歌官方推荐的用于隐藏地图 KEY 的插件 https://developers.google.com/maps/documentation/places/android-sdk/secrets-gradle-plugin?hl=zh-cn
+-        classpath("com.google.android.libraries.mapsplatform.secrets-gradle-plugin:secrets-gradle-plugin:2.0.1")
+ 
+         // NOTE: Do not place your application dependencies here; they belong
+         // in the individual module build.gradle files
+diff --git a/gradle.properties b/gradle.properties
+index 889d7ef..49ccae9 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -11,7 +11,7 @@ android.nonFinalResIds=true
+ android.nonTransitiveRClass=true
+ android.useAndroidX=true
+ org.gradle.jvmargs=-Xmx1536m
+-org.gradle.unsafe.configuration-cache=true
++org.gradle.unsafe.configuration-cache=false
+ org.gradle.warning.mode=all
+ # When configured, Gradle will run in incubating parallel mode.
+ # This option should only be used with decoupled projects. More details, visit
